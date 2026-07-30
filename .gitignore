@@ -3,6 +3,8 @@ node_modules/
 
 # Environment
 .env
+.env.*
+!.env.example
 
 # Browser profiles (session data)
 .profile/
@@ -15,9 +17,14 @@ node_modules/
 *-state.json
 
 # Queue and render outputs
+queue/*/*/pending/
 queue/*/*/posted/
 queue/*/*/failed/
 queue/uniquify-output/
+
+# Runtime and diagnostic artifacts
+/output/
+.playwright-cli/
 
 # Auto-download runtime data
 autodownload/downloads/
@@ -34,10 +41,17 @@ user-assets/
 # Local notes
 .local/
 
-# Debug screenshots
+# Debug screenshots and logs
 last-*.png
 qa-*.png
-.dashboard.*.log
+*.log
+
+# OS and editor temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*~
 
 # Saved browser pages (dev reference, root-level only)
 /*.html
