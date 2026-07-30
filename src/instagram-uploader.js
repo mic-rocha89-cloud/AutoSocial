@@ -116,7 +116,11 @@ async function closeLoginSession() {
   return { ok: true, alreadyClosed: false };
 }
 
-async function clickFirstVisibleEnabledLocator(page, locator) {
+async function clickFirstVisibleEnabledLocator(
+  page,
+  locator,
+  { allowForceFallback = true } = {}
+) {
   const total = await locator.count();
   for (let i = 0; i < total; i += 1) {
     const candidate = locator.nth(i);
@@ -129,6 +133,7 @@ async function clickFirstVisibleEnabledLocator(page, locator) {
       await candidate.click({ timeout: 5000 });
       return true;
     } catch {
+      if (!allowForceFallback) continue;
       try {
         await candidate.click({ timeout: 5000, force: true });
         return true;
@@ -140,13 +145,148 @@ async function clickFirstVisibleEnabledLocator(page, locator) {
   return false;
 }
 
+const VIDEO_POSTS_ARE_REELS_PATTERN = /video posts are now reels/i;
+const DISMISS_INFORMATION_PATTERN =
+  /^\s*(?:ok|okay|got it)\s*$/i;
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function exactUiTextPattern(...keys) {
+  const labels = uiLabels.terms(...keys);
+  return new RegExp(`^\\s*(?:${labels.map(escapeRegExp).join("|")})\\s*$`, "i");
+}
+
+function getUploadTriggerLocators(page) {
+  const uploadTriggerPattern = uiLabels.pattern("instagramUploadTrigger");
+  return [
+    page.getByRole("button", { name: uploadTriggerPattern }),
+    page.locator('button, [role="button"]').filter({
+      hasText: uploadTriggerPattern,
+    }),
+  ];
+}
+
+async function hasVisibleEnabledLocator(locator) {
+  const total = await locator.count();
+  for (let index = 0; index < total; index += 1) {
+    const candidate = locator.nth(index);
+    const visible = await candidate.isVisible().catch(() => false);
+    const disabled = await candidate.isDisabled().catch(() => false);
+    if (visible && !disabled) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function isCreateUploadReady(page, input) {
+  if ((await input.count()) > 0) {
+    return true;
+  }
+
+  for (const trigger of getUploadTriggerLocators(page)) {
+    if (await hasVisibleEnabledLocator(trigger)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function dismissVideoPostsAreReelsDialog(page) {
+  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const total = await dialogs.count();
+
+  for (let index = total - 1; index >= 0; index -= 1) {
+    const dialog = dialogs.nth(index);
+    if (!(await dialog.isVisible().catch(() => false))) continue;
+    const text = await dialog.innerText().catch(() => "");
+    if (!VIDEO_POSTS_ARE_REELS_PATTERN.test(text)) continue;
+
+    const dismissButtons = [
+      dialog.getByRole("button", { name: DISMISS_INFORMATION_PATTERN }),
+      dialog.locator("button").filter({ hasText: DISMISS_INFORMATION_PATTERN }),
+      dialog.locator('[role="button"]').filter({
+        hasText: DISMISS_INFORMATION_PATTERN,
+      }),
+    ];
+
+    for (const button of dismissButtons) {
+      const clicked = await clickFirstVisibleEnabledLocator(page, button, {
+        allowForceFallback: false,
+      });
+      if (!clicked) continue;
+      await dialog.waitFor({ state: "hidden", timeout: 10000 }).catch(() => {});
+      console.log('Instagram "video posts are now reels" notice dismissed.');
+      return true;
+    }
+
+    throw new Error(
+      'Instagram "video posts are now reels" notice is blocking the composer.'
+    );
+  }
+
+  return false;
+}
+
+function getCaptionLocators(root) {
+  return [
+    root.locator(uiLabels.attrSelector("textarea", "aria-label", "captionAttribute")),
+    root.locator(uiLabels.attrSelector("textarea", "placeholder", "captionAttribute")),
+    root.locator("textarea"),
+    root.locator('div[contenteditable="true"]'),
+  ];
+}
+
+async function findVisibleCaptionTarget(root) {
+  for (const locator of getCaptionLocators(root)) {
+    const total = await locator.count();
+    for (let index = 0; index < total; index += 1) {
+      const candidate = locator.nth(index);
+      if (await candidate.isVisible().catch(() => false)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+async function getActiveCreateSurface(page) {
+  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const total = await dialogs.count();
+  const exactNextPattern = exactUiTextPattern("next");
+  const exactSharePattern = exactUiTextPattern("share");
+
+  for (let index = total - 1; index >= 0; index -= 1) {
+    const dialog = dialogs.nth(index);
+    if (!(await dialog.isVisible().catch(() => false))) continue;
+    const text = await dialog.innerText().catch(() => "");
+    if (VIDEO_POSTS_ARE_REELS_PATTERN.test(text)) continue;
+
+    const hasNext =
+      (await dialog.getByRole("button", { name: exactNextPattern }).count()) > 0;
+    const hasShare =
+      (await dialog.getByRole("button", { name: exactSharePattern }).count()) > 0;
+    const hasCaption = Boolean(await findVisibleCaptionTarget(dialog));
+    if (hasNext || hasShare || hasCaption) {
+      return dialog;
+    }
+  }
+
+  return null;
+}
+
 async function ensureCreateFlowInput(page) {
   const input = page.locator('input[type="file"]').first();
-  if ((await input.count()) > 0) return input;
+  if (await isCreateUploadReady(page, input)) return input;
 
   const createPattern = uiLabels.pattern("create");
-  const postFormatPattern = uiLabels.pattern("instagramPostFormat", "instagramReelFormat");
+  const postFormatPattern = uiLabels.pattern("instagramPostFormat");
+  const exactPostFormatPattern = exactUiTextPattern("instagramPostFormat");
   const createEntryPoints = [
+    page.locator('a:has(svg[aria-label="New post" i])'),
     page.getByRole("link", { name: createPattern }),
     page.getByRole("button", { name: createPattern }),
     page.locator('a[href*="/create"]').filter({ hasText: createPattern }),
@@ -160,28 +300,56 @@ async function ensureCreateFlowInput(page) {
     if (!clicked) continue;
     console.log("Instagram create entry clicked.");
     await page.waitForTimeout(1200);
-    if ((await input.count()) > 0) return input;
+    if (await isCreateUploadReady(page, input)) return input;
+    // One successful click opens the format menu. Trying equivalent Create
+    // locators again can toggle that menu closed.
+    break;
   }
 
-  // Some flows open a chooser first (post/reel/story).
+  // The desktop flow opens a Post/Reels menu. Select Post specifically:
+  // "Reels" also exists in the main navigation and is not the upload format.
   const formatPickers = [
-    ...uiLabels
-      .terms("instagramPostFormat", "instagramReelFormat")
-      .map((term) => page.getByText(term, { exact: true })),
-    page.getByRole("button", { name: postFormatPattern }),
-    page.getByRole("menuitem", { name: postFormatPattern }),
-    page.getByRole("button", { name: /reel|reels/i }),
+    page.getByText(exactPostFormatPattern),
+    page.locator('a[role="link"][href="#"]').filter({
+      hasText: exactPostFormatPattern,
+    }),
+    page.getByRole("button", { name: exactPostFormatPattern }),
+    page.getByRole("menuitem", { name: exactPostFormatPattern }),
+    page.getByRole("option", { name: exactPostFormatPattern }),
+    page.getByRole("link", { name: exactPostFormatPattern }),
+    page
+      .locator(
+        [
+          '[role="button"]',
+          '[role="menuitem"]',
+          '[role="option"]',
+          '[role="link"]',
+          '[tabindex="0"]',
+          "button",
+          "a",
+          "div",
+          "span",
+        ].join(", ")
+      )
+      .filter({
+        hasText: exactPostFormatPattern,
+      }),
     page.locator('[role="menuitem"], [role="option"], button, a').filter({
       hasText: postFormatPattern,
     }),
   ];
+  let formatSelected = false;
   for (const picker of formatPickers) {
     const clicked = await clickFirstVisibleEnabledLocator(page, picker);
     if (!clicked) continue;
-    console.log("Instagram post format selected (Post/Reel).");
+    formatSelected = true;
+    console.log("Instagram post format selected (Post).");
     await page.waitForTimeout(1200);
-    if ((await input.count()) > 0) return input;
+    if (await isCreateUploadReady(page, input)) return input;
+    // Do not click the same Post item again through an equivalent locator.
+    break;
   }
+  if (formatSelected) return input;
 
   const createButtons = [
     page.getByRole("button", { name: uiLabels.pattern("create", "instagramPostFormat") }),
@@ -193,7 +361,7 @@ async function ensureCreateFlowInput(page) {
     const clicked = await clickFirstVisibleEnabledLocator(page, button);
     if (clicked) {
       await page.waitForTimeout(1200);
-      if ((await input.count()) > 0) return input;
+      if (await isCreateUploadReady(page, input)) return input;
     }
   }
 
@@ -210,13 +378,7 @@ async function setVideoFile(page, videoPath) {
 
   // Fallback: use file chooser event if no file input is exposed yet.
   const chooserPromise = page.waitForEvent("filechooser", { timeout: 10000 }).catch(() => null);
-  const uploadTriggerPattern = uiLabels.pattern("instagramUploadTrigger");
-  const uploadTriggers = [
-    page.getByRole("button", { name: uploadTriggerPattern }),
-    page.locator('button, [role="button"]').filter({
-      hasText: uploadTriggerPattern,
-    }),
-  ];
+  const uploadTriggers = getUploadTriggerLocators(page);
 
   for (const trigger of uploadTriggers) {
     const clicked = await clickFirstVisibleEnabledLocator(page, trigger);
@@ -232,66 +394,100 @@ async function setVideoFile(page, videoPath) {
     return;
   }
 
-  // One last attempt to locate input after opening dialogs.
+  // Some Instagram variants add the input only after the upload trigger click.
   input = page.locator('input[type="file"]').first();
   await input.waitFor({ state: "attached", timeout: 120000 });
   await input.setInputFiles(videoPath);
 }
 
 async function clickNextButtons(page) {
-  const nextSelectors = [
-    page.getByRole("button", { name: uiLabels.pattern("next") }),
-    page.locator("button").filter({ hasText: uiLabels.pattern("next") }),
-  ];
+  const exactNextPattern = exactUiTextPattern("next");
+  let clickCount = 0;
 
   for (let pass = 0; pass < 3; pass += 1) {
+    await dismissVideoPostsAreReelsDialog(page);
+    const surface = await getActiveCreateSurface(page);
+    if (!surface) {
+      throw new Error("Could not find the active Instagram create dialog.");
+    }
+    if (await findVisibleCaptionTarget(surface)) {
+      return clickCount;
+    }
+
+    const nextSelectors = [
+      surface.getByRole("button", { name: exactNextPattern }),
+      surface.locator("button").filter({ hasText: exactNextPattern }),
+      surface.locator('[role="button"]').filter({ hasText: exactNextPattern }),
+    ];
     let clicked = false;
     for (const selector of nextSelectors) {
-      const didClick = await clickFirstVisibleEnabledLocator(page, selector);
+      const didClick = await clickFirstVisibleEnabledLocator(page, selector, {
+        allowForceFallback: false,
+      });
       if (didClick) {
         clicked = true;
+        clickCount += 1;
         await page.waitForTimeout(1200);
         break;
       }
     }
-    if (!clicked) break;
+    if (!clicked) {
+      throw new Error(
+        `Could not find/click Instagram Next button in create step ${pass + 1}.`
+      );
+    }
   }
+
+  const surface = await getActiveCreateSurface(page);
+  if (surface && (await findVisibleCaptionTarget(surface))) {
+    return clickCount;
+  }
+  throw new Error("Instagram composer did not reach the caption step.");
 }
 
 async function setCaption(page, caption) {
   if (!caption) return;
-  const candidates = [
-    uiLabels.attrSelector("textarea", "aria-label", "captionAttribute"),
-    uiLabels.attrSelector("textarea", "placeholder", "captionAttribute"),
-    'textarea',
-    'div[contenteditable="true"]',
-  ];
 
-  for (const selector of candidates) {
-    const target = page.locator(selector).first();
-    if ((await target.count()) === 0) continue;
-    try {
-      await target.click({ timeout: 8000 });
-      await page.keyboard.press("Control+A");
-      await page.keyboard.press("Delete");
-      await target.type(caption, { delay: 10 });
-      return;
-    } catch {
-      // next
+  const surface = await getActiveCreateSurface(page);
+  if (!surface) {
+    throw new Error("Could not find the active Instagram create dialog.");
+  }
+
+  for (const locator of getCaptionLocators(surface)) {
+    const total = await locator.count();
+    for (let index = 0; index < total; index += 1) {
+      const candidate = locator.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      try {
+        await candidate.click({ timeout: 8000 });
+        await page.keyboard.press("Control+A");
+        await page.keyboard.press("Delete");
+        await candidate.type(caption, { delay: 10 });
+        return;
+      } catch {
+        // next
+      }
     }
   }
+
+  throw new Error("Could not fill the Instagram caption inside the create dialog.");
 }
 
 async function clickShare(page) {
-  const sharePattern = uiLabels.pattern("share");
+  const surface = await getActiveCreateSurface(page);
+  if (!surface) return false;
+
+  const sharePattern = exactUiTextPattern("share");
   const shareLocators = [
-    page.getByRole("button", { name: sharePattern }),
-    page.locator("button").filter({ hasText: sharePattern }),
-    page.locator('[role="button"]').filter({ hasText: sharePattern }),
+    surface.getByRole("button", { name: sharePattern }),
+    surface.locator("button").filter({ hasText: sharePattern }),
+    surface.locator('[role="button"]').filter({ hasText: sharePattern }),
   ];
 
   for (const locator of shareLocators) {
-    const clicked = await clickFirstVisibleEnabledLocator(page, locator);
+    const clicked = await clickFirstVisibleEnabledLocator(page, locator, {
+      allowForceFallback: false,
+    });
     if (clicked) return true;
   }
   return false;
@@ -377,5 +573,16 @@ module.exports = {
   startLoginSession,
   getLoginSessionStatus,
   closeLoginSession,
+  _private: {
+    ensureCreateFlowInput,
+    clickNextButtons,
+    clickShare,
+    dismissVideoPostsAreReelsDialog,
+    exactUiTextPattern,
+    getActiveCreateSurface,
+    isCreateUploadReady,
+    setCaption,
+    setVideoFile,
+  },
 };
 

@@ -63,6 +63,7 @@ const UI = {
     instagram: false,
     youtube: false,
   },
+  refreshGeneration: 0,
 
   els: {
     brandSelect: document.getElementById("brandSelect"),
@@ -1171,6 +1172,7 @@ const UI = {
   },
 
   async refresh() {
+    const generation = ++this.refreshGeneration;
     try {
       const [
         status,
@@ -1191,10 +1193,30 @@ const UI = {
         API.get("/api/instagram/login/status"),
         API.get("/api/youtube/login/status"),
       ]);
+      if (generation !== this.refreshGeneration) return;
+
       // Fetch autodownload status in parallel but don't block others
-      API.get("/api/autodownload/status").then((ad) => this.renderAutoDownloadStatus(ad)).catch(() => { });
-      API.get("/api/profile-download/status").then((pd) => this.renderProfileDownloadStatus(pd)).catch(() => { });
-      API.get("/api/overview").then((ov) => this.renderOverview(ov)).catch(() => { });
+      API.get("/api/autodownload/status")
+        .then((ad) => {
+          if (generation === this.refreshGeneration) {
+            this.renderAutoDownloadStatus(ad);
+          }
+        })
+        .catch(() => { });
+      API.get("/api/profile-download/status")
+        .then((pd) => {
+          if (generation === this.refreshGeneration) {
+            this.renderProfileDownloadStatus(pd);
+          }
+        })
+        .catch(() => { });
+      API.get("/api/overview")
+        .then((ov) => {
+          if (generation === this.refreshGeneration) {
+            this.renderOverview(ov);
+          }
+        })
+        .catch(() => { });
 
       this.renderStatus(status);
       this.renderInstagramStatus(instagramStatus);
@@ -1812,14 +1834,6 @@ const UI = {
       },
     ];
 
-    const activeCount = rows.filter(
-      (row) =>
-        this.accountState[row.platformKey]?.loginOpen ||
-        this.accountState[row.platformKey]?.sessionSaved
-    ).length;
-    if (this.els.activeAccountsCount) {
-      this.els.activeAccountsCount.textContent = String(activeCount);
-    }
     if (this.els.activeBrandLabel) {
       const suffix = this.accountState.activeBrandName
         ? `- ${this.accountState.activeBrandName}`

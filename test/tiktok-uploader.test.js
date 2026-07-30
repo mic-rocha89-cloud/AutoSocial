@@ -1,9 +1,14 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { chromium } = require("playwright");
 
 const { _private } = require("../src/tiktok-uploader");
 
-const { getPublishCandidateScore, isLikelyPublishCandidateInfo } = _private;
+const {
+  getPublishCandidateScore,
+  isLikelyPublishCandidateInfo,
+  setCaption,
+} = _private;
 
 test("TikTok publish candidate rejects the Studio sidebar Posts item", () => {
   const candidate = {
@@ -117,4 +122,42 @@ test("TikTok secondary confirm terms reject plain Post and sidebar Posts", () =>
 
   assert.equal(getPublishCandidateScore(sidebar, secondaryTerms), -1);
   assert.equal(getPublishCandidateScore(bottomButton, secondaryTerms), -1);
+});
+
+test("TikTok caption flow dismisses blocking dialogs before filling description", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <style>
+      .overlay {
+        align-items: center;
+        background: rgba(0, 0, 0, 0.6);
+        display: flex;
+        inset: 0;
+        justify-content: center;
+        position: fixed;
+        z-index: 10;
+      }
+      #editing-tip { z-index: 11; }
+    </style>
+    <div>
+      <label for="description">Description</label>
+      <div id="description" role="textbox" contenteditable="true">generated filename</div>
+    </div>
+    <div id="content-checks" class="overlay" role="dialog">
+      <button onclick="document.querySelector('#content-checks').remove()">Cancel</button>
+      <button>Turn on</button>
+    </div>
+    <div id="editing-tip" class="overlay" role="dialog">
+      <button onclick="document.querySelector('#editing-tip').remove()">Got it</button>
+    </div>
+  `);
+
+  const caption = "Controlled AutoSocial QA caption.";
+  await setCaption(page, caption);
+
+  assert.equal(await page.locator('[role="dialog"]').count(), 0);
+  assert.equal(await page.locator("#description").textContent(), caption);
 });

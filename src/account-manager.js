@@ -157,39 +157,60 @@ async function getAllAccounts() {
   return clone(state.accounts);
 }
 
-async function getPlatformProfileDir(platform, accountId) {
-  const acctId = accountId || (await getActiveAccount()).id;
-  if (acctId === DEFAULT_ACCOUNT.id && LEGACY_PROFILE_DIRS[platform]) {
-    try {
-      await fs.stat(LEGACY_PROFILE_DIRS[platform]);
-      return LEGACY_PROFILE_DIRS[platform];
-    } catch {
-      // Fall through to new path
-    }
-  }
-  return path.resolve(config.projectRoot, ".profiles", acctId, platform);
+function getCookieCandidates(profileDir) {
+  return [
+    path.resolve(profileDir, "Default", "Network", "Cookies"),
+    path.resolve(profileDir, "Default", "Cookies"),
+    path.resolve(profileDir, "Network", "Cookies"),
+    path.resolve(profileDir, "Cookies"),
+  ];
 }
 
-async function hasSavedPlatformSession(platform, accountId) {
-  const profileDir = await getPlatformProfileDir(platform, accountId);
-  const cookieCandidates = [
-    path.resolve(profileDir, "Default", "Cookies"),
-    path.resolve(profileDir, "Cookies"),
-    path.resolve(profileDir, "Network", "Cookies"),
-  ];
-
-  for (const filePath of cookieCandidates) {
+async function hasSavedSessionInProfileDir(profileDir) {
+  for (const filePath of getCookieCandidates(profileDir)) {
     try {
       const stat = await fs.stat(filePath);
       if (stat.isFile() && stat.size > 0) {
         return true;
       }
     } catch {
-      // continue
+      // Try the next supported Chromium cookie database location.
     }
   }
 
   return false;
+}
+
+async function selectProfileDir(modernProfileDir, legacyProfileDir) {
+  if (!legacyProfileDir || path.resolve(legacyProfileDir) === path.resolve(modernProfileDir)) {
+    return modernProfileDir;
+  }
+
+  if (await hasSavedSessionInProfileDir(modernProfileDir)) {
+    return modernProfileDir;
+  }
+
+  if (await hasSavedSessionInProfileDir(legacyProfileDir)) {
+    return legacyProfileDir;
+  }
+
+  return modernProfileDir;
+}
+
+async function getPlatformProfileDir(platform, accountId) {
+  const acctId = accountId || (await getActiveAccount()).id;
+  const modernProfileDir = path.resolve(config.projectRoot, ".profiles", acctId, platform);
+
+  if (acctId === DEFAULT_ACCOUNT.id && LEGACY_PROFILE_DIRS[platform]) {
+    return selectProfileDir(modernProfileDir, LEGACY_PROFILE_DIRS[platform]);
+  }
+
+  return modernProfileDir;
+}
+
+async function hasSavedPlatformSession(platform, accountId) {
+  const profileDir = await getPlatformProfileDir(platform, accountId);
+  return hasSavedSessionInProfileDir(profileDir);
 }
 
 module.exports = {
@@ -203,4 +224,9 @@ module.exports = {
   getPlatformProfileDir,
   hasSavedPlatformSession,
   PLATFORMS,
+  _private: {
+    getCookieCandidates,
+    hasSavedSessionInProfileDir,
+    selectProfileDir,
+  },
 };

@@ -21,13 +21,13 @@ async function bootstrap() {
 function logResult(result) {
   if (result.skipped) {
     console.log(result.reason);
-    return;
+    return 0;
   }
 
   if (result.ok) {
     console.log("Post complete.");
     console.log(`Moved video: ${result.movedVideo}`);
-    return;
+    return 0;
   }
 
   console.error("Post failed.");
@@ -35,6 +35,7 @@ function logResult(result) {
   if (result.screenshotPath) {
     console.error(`Screenshot: ${result.screenshotPath}`);
   }
+  return 1;
 }
 
 async function run() {
@@ -67,7 +68,10 @@ async function run() {
         const result = argv.video
           ? await postFromManualInput(path.resolve(argv.video), argv.caption)
           : await postNextFromQueue();
-        logResult(result);
+        const resultExitCode = logResult(result);
+        if (resultExitCode !== 0) {
+          process.exitCode = resultExitCode;
+        }
       }
     )
     .command(
@@ -179,8 +183,16 @@ async function run() {
     .parse();
 }
 
-run().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  run().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  _private: {
+    logResult,
+  },
+};
 

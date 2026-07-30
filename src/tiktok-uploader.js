@@ -39,31 +39,41 @@ async function setCaption(page, caption) {
     return;
   }
 
+  await dismissInterferingOverlays(page);
+
   const candidates = [
+    '[contenteditable="true"][aria-label*="description" i]',
+    '[contenteditable="true"][aria-label*="caption" i]',
+    '[contenteditable="true"][data-e2e*="caption" i]',
+    '[contenteditable="true"][role="textbox"]',
     'div[contenteditable="true"]',
+    'textarea[placeholder*="description" i]',
     'textarea[placeholder*="caption" i]',
     'textarea',
   ];
 
   for (const selector of candidates) {
-    const target = page.locator(selector).first();
-    const count = await target.count();
-    if (count === 0) {
-      continue;
-    }
+    const matches = page.locator(selector);
+    const count = await matches.count();
 
-    try {
-      await target.click({ timeout: 8000 });
-      await page.keyboard.press("Control+A");
-      await page.keyboard.press("Delete");
-      await target.type(caption, { delay: 10 });
-      return;
-    } catch {
-      // Try the next candidate selector.
+    for (let index = 0; index < count; index += 1) {
+      const target = matches.nth(index);
+      const visible = await target.isVisible().catch(() => false);
+      if (!visible) {
+        continue;
+      }
+
+      try {
+        await target.scrollIntoViewIfNeeded({ timeout: 3000 });
+        await target.fill(caption, { timeout: 8000 });
+        return;
+      } catch {
+        // Try the next visible caption candidate.
+      }
     }
   }
 
-  throw new Error("Could not find caption input field.");
+  throw new Error("Could not fill a visible caption or description field.");
 }
 
 function escapeRegExp(value) {
@@ -699,34 +709,40 @@ async function disableShortContentCheck(page) {
 }
 
 async function clickFirstVisibleButton(page, nameRegex, timeout = 3000) {
-  const button = page.getByRole("button", { name: nameRegex }).first();
-  if ((await button.count()) === 0) {
-    return false;
+  const buttons = page.getByRole("button", { name: nameRegex });
+  const total = await buttons.count();
+
+  for (let index = 0; index < total; index += 1) {
+    const button = buttons.nth(index);
+    const visible = await button.isVisible().catch(() => false);
+    const disabled = await button.isDisabled().catch(() => false);
+    if (!visible || disabled) {
+      continue;
+    }
+
+    try {
+      await button.click({ timeout });
+      return true;
+    } catch {
+      // Try the next matching visible button.
+    }
   }
-  try {
-    await button.click({ timeout });
-    return true;
-  } catch {
-    return false;
-  }
+
+  return false;
 }
 
 async function dismissInterferingOverlays(page) {
-  await page
-    .getByRole("button", { name: uiLabels.pattern("tiktokCancel") })
-    .click({ timeout: 800 })
-    .catch(() => { });
-
   // TikTok Studio sometimes opens "content checks" and other hints dialogs
-  // that block the publish button; dismiss/accept them before publishing.
+  // that block the caption field and publish button. Prefer dismissive actions
+  // so the automation does not silently enable optional account settings.
   const overlayActions = [
-    uiLabels.pattern("tiktokEnable"),
-    uiLabels.pattern("tiktokContinue"),
+    uiLabels.pattern("tiktokCancel"),
     uiLabels.pattern("tiktokLater"),
+    uiLabels.pattern("tiktokContinue"),
     uiLabels.pattern("tiktokClose"),
   ];
 
-  for (let pass = 0; pass < 3; pass += 1) {
+  for (let pass = 0; pass < 5; pass += 1) {
     let clickedSomething = false;
     for (const action of overlayActions) {
       const clicked = await clickFirstVisibleButton(page, action, 1200);
@@ -1258,7 +1274,9 @@ module.exports = {
   closeLoginSession,
   uploadVideo,
   _private: {
+    dismissInterferingOverlays,
     getPublishCandidateScore,
     isLikelyPublishCandidateInfo,
+    setCaption,
   },
 };
