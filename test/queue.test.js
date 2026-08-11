@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("crypto");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
@@ -48,6 +49,70 @@ test("getNextQueuedItem defers caption reads until after durable claim", async (
   );
 });
 
+test("getNextQueuedItem captures stable selected video content identity", async () => {
+  const dir = await makeTempDir();
+  const videoPath = path.join(dir, "clip.mp4");
+  const selectedVideo = Buffer.from("selected-video");
+  await fs.writeFile(videoPath, selectedVideo);
+
+  const item = await getNextQueuedItem(dir);
+
+  assert.equal(item.videoIdentity.path, videoPath);
+  assert.equal(item.videoIdentity.size, String(selectedVideo.length));
+  assert.equal(
+    item.videoIdentity.sha256,
+    crypto.createHash("sha256").update(selectedVideo).digest("hex")
+  );
+  assert.equal(typeof item.videoIdentity.dev, "string");
+  assert.equal(typeof item.videoIdentity.ino, "string");
+});
+
+test("legitimate claim keeps selected, claimed-source, and snapshot hashes equal", async () => {
+  const root = await makeTempDir();
+  const pending = path.join(root, "pending");
+  await fs.mkdir(pending);
+  const videoPath = path.join(pending, "clip.mp4");
+  await fs.writeFile(videoPath, "selected-video");
+  const item = await getNextQueuedItem(pending);
+  const originalOpen = fs.open;
+  let claimedSourceSha256 = null;
+
+  fs.open = async (...args) => {
+    const [filePath, flags] = args;
+    if (
+      claimedSourceSha256 === null &&
+      flags === "r" &&
+      path.basename(filePath) === ".claim-source-video"
+    ) {
+      const evidenceHandle = await originalOpen(...args);
+      try {
+        const claimedContent = await evidenceHandle.readFile();
+        claimedSourceSha256 = crypto
+          .createHash("sha256")
+          .update(claimedContent)
+          .digest("hex");
+      } finally {
+        await evidenceHandle.close();
+      }
+    }
+    return originalOpen(...args);
+  };
+
+  let claim;
+  try {
+    claim = await claimQueuedItem(item, pending);
+  } finally {
+    fs.open = originalOpen;
+  }
+
+  const binding = JSON.parse(
+    await fs.readFile(claim.snapshotBindingPath, "utf8")
+  );
+  assert.equal(item.videoIdentity.sha256, claimedSourceSha256);
+  assert.equal(claimedSourceSha256, binding.video.sha256);
+  assert.equal(item.videoIdentity.size, binding.video.size);
+});
+
 test("claimQueuedItem atomically removes a selected video from pending", async () => {
   const root = await makeTempDir();
   const pending = path.join(root, "pending");
@@ -61,6 +126,9 @@ test("claimQueuedItem atomically removes a selected video from pending", async (
   const stateDirs = getQueueStateDirs(pending);
   const markerPath = getClaimMarkerPath(videoPath, pending);
   const manifest = JSON.parse(await fs.readFile(markerPath, "utf8"));
+  const binding = JSON.parse(
+    await fs.readFile(claim.snapshotBindingPath, "utf8")
+  );
 
   await assert.rejects(fs.access(videoPath));
   await assert.rejects(fs.access(path.join(pending, "clip.description")));
@@ -77,6 +145,8 @@ test("claimQueuedItem atomically removes a selected video from pending", async (
   assert.equal(manifest.item.originalPath, videoPath);
   assert.equal(manifest.item.snapshotPath, claim.videoPath);
   assert.equal(manifest.bindingPath, claim.snapshotBindingPath);
+  assert.equal(manifest.item.selectedIdentity.size, binding.video.size);
+  assert.equal(manifest.item.selectedIdentity.sha256, binding.video.sha256);
   assert.deepEqual(
     manifest.sidecars.map(({ originalPath, present }) => ({
       name: path.basename(originalPath),
@@ -222,6 +292,149 @@ test("same-name video replacement between selection and claim fails closed", asy
     );
   } finally {
     fs.link = originalLink;
+  }
+
+  assert.equal(replacementInjected, true);
+  assert.equal(await getNextQueuedItem(pending), null);
+});
+
+test("same-inode overwrite between selection and claim fails closed", async () => {
+  const root = await makeTempDir();
+  const pending = path.join(root, "pending");
+  await fs.mkdir(pending);
+  const videoPath = path.join(pending, "clip.mp4");
+  await fs.writeFile(videoPath, "selected-video");
+  const selectedStat = await fs.stat(videoPath, { bigint: true });
+  const item = await getNextQueuedItem(pending);
+  const originalLink = fs.link;
+  let replacementInjected = false;
+  let replacementStat;
+
+  fs.link = async (sourcePath, targetPath) => {
+    await originalLink(sourcePath, targetPath);
+    if (!replacementInjected) {
+      replacementInjected = true;
+      await fs.writeFile(videoPath, "same-inode-replacement");
+      replacementStat = await fs.stat(videoPath, { bigint: true });
+    }
+  };
+
+  try {
+    await assert.rejects(
+      claimQueuedItem(item, pending),
+      (error) =>
+        error.code === "EQUEUEINTEGRITY" && error.requiresRecovery === true
+    );
+  } finally {
+    fs.link = originalLink;
+  }
+
+  assert.equal(replacementInjected, true);
+  assert.equal(replacementStat.dev, selectedStat.dev);
+  assert.equal(replacementStat.ino, selectedStat.ino);
+  assert.equal(await getNextQueuedItem(pending), null);
+});
+
+test("same-inode compromised content never reaches the uploader", async () => {
+  const root = await makeTempDir();
+  const pending = path.join(root, "pending");
+  const postedDir = path.join(root, "posted");
+  const failedDir = path.join(root, "failed");
+  await Promise.all(
+    [pending, postedDir, failedDir].map((dir) => fs.mkdir(dir))
+  );
+  const videoPath = path.join(pending, "clip.mp4");
+  await fs.writeFile(videoPath, "selected-video");
+
+  const uploaderPath = require.resolve("../src/tiktok-uploader");
+  const postServicePath = require.resolve("../src/post-service");
+  const originalUploaderModule = require.cache[uploaderPath];
+  const originalLink = fs.link;
+  let replacementInjected = false;
+  let uploadCalls = 0;
+
+  require.cache[uploaderPath] = {
+    id: uploaderPath,
+    filename: uploaderPath,
+    loaded: true,
+    exports: {
+      uploadVideo() {
+        uploadCalls += 1;
+        return Promise.resolve({ ok: true, outcome: "success" });
+      },
+    },
+  };
+  delete require.cache[postServicePath];
+  const { postNextFromQueue } = require(postServicePath);
+
+  fs.link = async (sourcePath, targetPath) => {
+    await originalLink(sourcePath, targetPath);
+    if (!replacementInjected) {
+      replacementInjected = true;
+      await fs.writeFile(videoPath, "same-inode-replacement");
+    }
+  };
+
+  let result;
+  try {
+    result = await postNextFromQueue({
+      queueDir: pending,
+      postedDir,
+      failedDir,
+    });
+  } finally {
+    fs.link = originalLink;
+    delete require.cache[postServicePath];
+    if (originalUploaderModule) {
+      require.cache[uploaderPath] = originalUploaderModule;
+    } else {
+      delete require.cache[uploaderPath];
+    }
+  }
+
+  assert.equal(replacementInjected, true);
+  assert.equal(uploadCalls, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.retryAllowed, false);
+  assert.equal(result.clickAttempted, false);
+  assert.match(result.reason, /could not atomically claim/i);
+  assert.equal(await getNextQueuedItem(pending), null);
+});
+
+test("video replacement after claimed identity capture but before snapshot fails closed", async () => {
+  const root = await makeTempDir();
+  const pending = path.join(root, "pending");
+  await fs.mkdir(pending);
+  const videoPath = path.join(pending, "clip.mp4");
+  await fs.writeFile(videoPath, "selected-video");
+  const item = await getNextQueuedItem(pending);
+  const originalOpen = fs.open;
+  let claimedSourceOpenCount = 0;
+  let replacementInjected = false;
+
+  fs.open = async (...args) => {
+    const [filePath, flags] = args;
+    if (
+      flags === "r" &&
+      path.basename(filePath) === ".claim-source-video"
+    ) {
+      claimedSourceOpenCount += 1;
+      if (claimedSourceOpenCount === 2) {
+        replacementInjected = true;
+        await fs.writeFile(filePath, "post-claim-replacement");
+      }
+    }
+    return originalOpen(...args);
+  };
+
+  try {
+    await assert.rejects(
+      claimQueuedItem(item, pending),
+      (error) =>
+        error.code === "EQUEUEINTEGRITY" && error.requiresRecovery === true
+    );
+  } finally {
+    fs.open = originalOpen;
   }
 
   assert.equal(replacementInjected, true);

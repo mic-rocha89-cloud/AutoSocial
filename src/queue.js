@@ -52,7 +52,7 @@ async function getNextQueuedItem(queueDir) {
     return null;
   }
 
-  const videoIdentity = await inspectFileIdentity(videoPath);
+  const videoIdentity = await inspectStableFile(videoPath);
   return {
     videoPath,
     videoIdentity,
@@ -115,25 +115,6 @@ function serializeStat(stat) {
     mtimeNs: stat.mtimeNs.toString(),
     ctimeNs: stat.ctimeNs.toString(),
   };
-}
-
-async function inspectFileIdentity(filePath) {
-  let handle;
-  try {
-    handle = await fs.open(filePath, "r");
-    const stat = await handle.stat({ bigint: true });
-    if (!stat.isFile()) {
-      throw makeIntegrityError(`Queue path is not a regular file: ${filePath}`);
-    }
-    return {
-      dev: stat.dev.toString(),
-      ino: stat.ino.toString(),
-    };
-  } finally {
-    if (handle) {
-      await handle.close().catch(() => {});
-    }
-  }
 }
 
 function sameStat(left, right) {
@@ -596,11 +577,8 @@ async function claimQueuedItem(item, queueDir) {
     markerCreated = true;
     await assertObservedSidecarsUnchanged(sidecars);
     await fs.rename(item.videoPath, sourceVideoPath);
-    const claimedVideoIdentity = await inspectFileIdentity(sourceVideoPath);
-    if (
-      claimedVideoIdentity.dev !== item.videoIdentity.dev ||
-      claimedVideoIdentity.ino !== item.videoIdentity.ino
-    ) {
+    const claimedVideoIdentity = await inspectStableFile(sourceVideoPath);
+    if (!sameContentIdentity(item.videoIdentity, claimedVideoIdentity)) {
       throw makeIntegrityError(
         "The selected queue video was replaced before it could be snapshotted."
       );
@@ -633,6 +611,11 @@ async function claimQueuedItem(item, queueDir) {
       sourceVideoPath,
       snapshotVideoPath
     );
+    if (!sameContent(item.videoIdentity, videoSnapshot)) {
+      throw makeIntegrityError(
+        "The selected queue video content changed while its snapshot was being formed."
+      );
+    }
     await fs.unlink(sourceVideoPath);
     for (let index = 0; index < manifest.sidecars.length; index += 1) {
       const sidecar = manifest.sidecars[index];
