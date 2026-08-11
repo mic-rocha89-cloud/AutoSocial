@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs/promises");
+const crypto = require("crypto");
 const { chromium } = require("playwright");
 const { config } = require("./config");
 const uiLabels = require("./platform-ui-labels");
@@ -39,7 +40,13 @@ async function setCaption(page, caption) {
     return;
   }
 
-  await dismissInterferingOverlays(page);
+  const overlayState = await detectInterferingOverlays(page);
+  if (overlayState.blocked) {
+    throw new Error(
+      "TikTok caption editing is blocked by a visible dialog; " +
+        "automatic dialog interaction is disabled."
+    );
+  }
 
   const candidates = [
     '[contenteditable="true"][aria-label*="description" i]',
@@ -121,8 +128,15 @@ function normalizeUiText(value) {
 }
 
 function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
-  const text = normalizeUiText(info?.text || info?.ariaLabel);
-  if (!text || info?.disabled || info?.inNavigation) {
+  const visibleText = normalizeUiText(info?.text);
+  const ariaLabel = normalizeUiText(info?.ariaLabel);
+  const text = visibleText || ariaLabel;
+  if (
+    !text ||
+    info?.disabled ||
+    info?.inNavigation ||
+    !info?.structuralBinding
+  ) {
     return -1;
   }
 
@@ -141,12 +155,9 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
     return -1;
   }
 
-  const labels = publishTerms.map(normalizeUiText).filter(Boolean);
-  const exactMatch = labels.includes(text);
-  const nonAmbiguousMatch = labels
-    .filter((label) => label !== "post")
-    .some((label) => text.includes(label));
-  if (!exactMatch && !nonAmbiguousMatch) {
+  const labels = new Set(publishTerms.map(normalizeUiText).filter(Boolean));
+  const identities = new Set([visibleText, ariaLabel].filter(Boolean));
+  if (identities.size !== 1 || !labels.has([...identities][0])) {
     return -1;
   }
 
@@ -174,8 +185,7 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   }
 
   let score = 0;
-  if (exactMatch) score += 30;
-  if (nonAmbiguousMatch) score += 20;
+  score += 30;
   if (tagName === "button") score += 20;
   if (normalizeUiText(info?.type) === "submit") score += 20;
   if (hasPublishCue) score += 20;
@@ -191,8 +201,11 @@ function isLikelyPublishCandidateInfo(info, publishTerms = uiLabels.terms("tikto
   return getPublishCandidateScore(info, publishTerms) >= 0;
 }
 
-async function getPublishCandidateInfo(candidate) {
-  return candidate.evaluate((el) => {
+async function getPublishCandidateInfo(
+  candidate,
+  { inspectFinalBoundary = false, originallySelected = null } = {}
+) {
+  return candidate.evaluate((el, boundaryOptions) => {
     const clickable = el.closest("button, [role='button'], a") || el;
     const rect = clickable.getBoundingClientRect();
     const className = (clickable.className || "").toString();
@@ -225,7 +238,35 @@ async function getPublishCandidateInfo(candidate) {
       )
     );
     const anchor = clickable.closest("a");
-    return {
+    const blockedStructuralAncestorSelector = [
+      "nav",
+      "aside",
+      "[role='navigation']",
+      "[role='dialog']",
+      "[aria-modal='true']",
+    ].join(", ");
+    let structuralBinding = "";
+    const structuralRoot = clickable.closest("form");
+
+    if (structuralRoot) {
+      const activeUploadInputs = Array.from(
+        structuralRoot.querySelectorAll('input[type="file"]')
+      ).filter(
+        (input) =>
+          input.isConnected &&
+          !input.disabled &&
+          input.files &&
+          input.files.length > 0
+      );
+      if (
+        activeUploadInputs.length === 1 &&
+        !structuralRoot.closest(blockedStructuralAncestorSelector)
+      ) {
+        structuralBinding = "active-upload-form";
+      }
+    }
+
+    const info = {
       ariaLabel: clickable.getAttribute("aria-label") || "",
       className,
       dataAttributes,
@@ -241,76 +282,150 @@ async function getPublishCandidateInfo(candidate) {
         height: rect.height,
       },
       role: clickable.getAttribute("role") || "",
+      structuralBinding,
       tagName: clickable.tagName,
       type: clickable.getAttribute("type") || "",
       text: clickable.textContent || "",
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
-  });
+
+    if (!boundaryOptions.inspectFinalBoundary) {
+      return info;
+    }
+
+    const visibleDialogCount = Array.from(
+      document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+    ).filter((dialog) => {
+      const style = window.getComputedStyle(dialog);
+      const rect = dialog.getBoundingClientRect();
+      return (
+        dialog.isConnected &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    }).length;
+
+    return {
+      ...info,
+      finalBoundary: {
+        sameOwner: clickable === boundaryOptions.originallySelected,
+        visibleDialogCount,
+      },
+    };
+  }, { inspectFinalBoundary, originallySelected });
 }
 
-async function clickFirstLikelyPublishLocator(page, locator, publishTerms = uiLabels.terms("tiktokPublish")) {
-  const total = await locator.count();
-  if (total === 0) {
-    return false;
+async function getCanonicalPublishOwner(candidate) {
+  const ownerHandle = await candidate
+    .evaluateHandle(
+      (element) =>
+        element.closest("button, [role='button'], a") || element
+    )
+    .catch(() => null);
+  if (!ownerHandle) {
+    return null;
   }
 
-  const candidates = [];
-  for (let i = 0; i < total; i += 1) {
-    const candidate = locator.nth(i);
-    const visible = await candidate.isVisible().catch(() => false);
-    if (!visible) {
-      continue;
-    }
-
-    const info = await getPublishCandidateInfo(candidate).catch(() => null);
-    const score = getPublishCandidateScore(info, publishTerms);
-    if (score < 0) {
-      continue;
-    }
-
-    candidates.push({ candidate, info, score });
+  const owner = ownerHandle.asElement();
+  if (!owner) {
+    await ownerHandle.dispose().catch(() => {});
+    return null;
   }
+  return owner;
+}
 
-  candidates.sort((a, b) => {
-    if (b.score !== a.score) {
-      return b.score - a.score;
-    }
-    return (Number(b.info?.rect?.top) || 0) - (Number(a.info?.rect?.top) || 0);
-  });
+function getPublishCandidateLocators(page) {
+  const exactPublishName = new RegExp(
+    `^(?:${uiLabels
+      .terms("tiktokPublish")
+      .map((label) => escapeRegExp(normalizeUiText(label)))
+      .join("|")})$`,
+    "i"
+  );
 
-  for (const entry of candidates) {
-    const { candidate, info, score } = entry;
+  return [
+    page.getByRole("button", { name: exactPublishName }),
+    page.locator("button, [role='button'], a"),
+  ];
+}
 
-    try {
-      await candidate.scrollIntoViewIfNeeded({ timeout: 3000 });
-      await page.waitForTimeout(250);
-      await candidate.click({ timeout: 5000 });
-      const rect = info?.rect || {};
-      console.log(
-        `Publish candidate clicked: "${normalizeUiText(info?.text || info?.ariaLabel)}" score=${score.toFixed(1)} ` +
-          `rect=${Math.round(Number(rect.left) || 0)},${Math.round(Number(rect.top) || 0)},` +
-          `${Math.round(Number(rect.width) || 0)}x${Math.round(Number(rect.height) || 0)}`
-      );
-      return true;
-    } catch {
-      try {
-        await candidate.click({ timeout: 5000, force: true });
-        const rect = info?.rect || {};
-        console.log(
-          `Publish candidate force-clicked: "${normalizeUiText(info?.text || info?.ariaLabel)}" score=${score.toFixed(1)} ` +
-            `rect=${Math.round(Number(rect.left) || 0)},${Math.round(Number(rect.top) || 0)},` +
-            `${Math.round(Number(rect.width) || 0)}x${Math.round(Number(rect.height) || 0)}`
-        );
-        return true;
-      } catch {
-        // Continue to next candidate.
+async function disposePublishTargets(targets) {
+  await Promise.all(
+    targets.map(({ handle }) => handle.dispose().catch(() => {}))
+  );
+}
+
+async function collectUniquePublishTargets(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const targets = [];
+
+  try {
+    for (const locator of getPublishCandidateLocators(page)) {
+      const total = await locator.count();
+      for (let index = 0; index < total; index += 1) {
+        const candidate = locator.nth(index);
+        if (!(await candidate.isVisible().catch(() => false))) {
+          continue;
+        }
+
+        const handle = await getCanonicalPublishOwner(candidate);
+        if (!handle) {
+          continue;
+        }
+
+        const info = await getPublishCandidateInfo(handle).catch(() => null);
+        const score = getPublishCandidateScore(info, publishTerms);
+        if (score < 0) {
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+
+        let duplicateIndex = -1;
+        for (let targetIndex = 0; targetIndex < targets.length; targetIndex += 1) {
+          const existing = targets[targetIndex];
+          const sameOwner = await handle
+            .evaluate(
+              (element, other) => element === other,
+              existing.handle
+            )
+            .catch(() => false);
+          if (sameOwner) {
+            duplicateIndex = targetIndex;
+            break;
+          }
+        }
+
+        if (duplicateIndex < 0) {
+          targets.push({ handle, info, score });
+          continue;
+        }
+
+        const existing = targets[duplicateIndex];
+        existing.info = score > existing.score ? info : existing.info;
+        existing.score = Math.max(score, existing.score);
+        await handle.dispose().catch(() => {});
       }
     }
-  }
 
-  return false;
+    targets.sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return (
+        (Number(b.info?.rect?.top) || 0) -
+        (Number(a.info?.rect?.top) || 0)
+      );
+    });
+    return targets;
+  } catch (error) {
+    await disposePublishTargets(targets);
+    throw error;
+  }
 }
 
 async function addDefaultSound(page, source) {
@@ -708,227 +823,250 @@ async function disableShortContentCheck(page) {
   console.log("Short content check toggle found but could not be switched off.");
 }
 
-async function clickFirstVisibleButton(page, nameRegex, timeout = 3000) {
-  const buttons = page.getByRole("button", { name: nameRegex });
-  const total = await buttons.count();
+async function detectInterferingOverlays(page) {
+  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const dialogCount = await dialogs.count();
+  let visibleDialogCount = 0;
 
-  for (let index = 0; index < total; index += 1) {
-    const button = buttons.nth(index);
-    const visible = await button.isVisible().catch(() => false);
-    const disabled = await button.isDisabled().catch(() => false);
-    if (!visible || disabled) {
-      continue;
+  for (let dialogIndex = 0; dialogIndex < dialogCount; dialogIndex += 1) {
+    const dialog = dialogs.nth(dialogIndex);
+    if (await dialog.isVisible().catch(() => false)) {
+      visibleDialogCount += 1;
+    }
+  }
+
+  return {
+    blocked: visibleDialogCount > 0,
+    visibleDialogCount,
+  };
+}
+
+async function readBodyText(page) {
+  return page
+    .locator("body")
+    .innerText()
+    .then((value) => value || "")
+    .catch(() => "");
+}
+
+async function findUniquePublishTarget(
+  page,
+  { maxPolls = 6, pollIntervalMs = 2000 } = {}
+) {
+  const safeMaxPolls = Math.max(1, Number(maxPolls) || 1);
+  const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
+
+  for (let poll = 0; poll < safeMaxPolls; poll += 1) {
+    const targets = await collectUniquePublishTargets(page);
+    if (targets.length > 1) {
+      const count = targets.length;
+      await disposePublishTargets(targets);
+      return {
+        status: "multiple",
+        count,
+        reason:
+          "Could not safely publish on TikTok: multiple distinct active Publish/Post buttons.",
+      };
+    }
+    if (targets.length === 1) {
+      return { status: "unique", target: targets[0] };
+    }
+    if (poll + 1 < safeMaxPolls) {
+      await page.waitForTimeout(safePollIntervalMs);
+    }
+  }
+
+  return {
+    status: "none",
+    count: 0,
+    reason:
+      "Could not find exactly one enabled TikTok Publish/Post button before any click.",
+  };
+}
+
+async function clickPublishOnce(
+  page,
+  {
+    maxPolls = 6,
+    pollIntervalMs = 2000,
+    settleMs = 500,
+    beforeFinalValidation,
+    beforeClick,
+    publishResponseTracker,
+    operationId,
+  } = {}
+) {
+  const overlayState = await detectInterferingOverlays(page);
+  if (overlayState.blocked) {
+    return {
+      ok: false,
+      outcome: "failure",
+      retryAllowed: true,
+      clickAttempted: false,
+      reason:
+        "TikTok Publish/Post is blocked by a visible dialog; " +
+        "automatic dialog interaction is disabled.",
+    };
+  }
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForTimeout(Math.max(0, Number(settleMs) || 0));
+
+  const resolved = await findUniquePublishTarget(page, {
+    maxPolls,
+    pollIntervalMs,
+  });
+  if (resolved.status !== "unique") {
+    return {
+      ok: false,
+      outcome: "failure",
+      retryAllowed: true,
+      clickAttempted: false,
+      reason: resolved.reason,
+    };
+  }
+
+  const selectedTarget = resolved.target;
+  let finalTarget = null;
+  const actionGuard = createPublishActionGuard();
+  try {
+    try {
+      await selectedTarget.handle.scrollIntoViewIfNeeded({ timeout: 3000 });
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason: `Could not prepare the TikTok Publish/Post button before click: ${error.message}`,
+      };
+    }
+
+    if (beforeFinalValidation) {
+      await beforeFinalValidation();
+    }
+
+    if (beforeClick) {
+      await beforeClick();
+    }
+
+    if (
+      publishResponseTracker &&
+      typeof publishResponseTracker.beginClick === "function"
+    ) {
+      publishResponseTracker.beginClick(operationId);
+    }
+
+    const finalTargets = await collectUniquePublishTargets(page);
+    if (finalTargets.length !== 1) {
+      const count = finalTargets.length;
+      await disposePublishTargets(finalTargets);
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok Publish/Post target changed immediately before click: " +
+          `expected exactly one canonical owner, observed ${count}.`,
+      };
+    }
+
+    finalTarget = finalTargets[0];
+    const finalBoundaryInfo = await getPublishCandidateInfo(
+      finalTarget.handle,
+      {
+        inspectFinalBoundary: true,
+        originallySelected: selectedTarget.handle,
+      }
+    ).catch(() => null);
+    if (!finalBoundaryInfo?.finalBoundary?.sameOwner) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok Publish/Post target identity changed immediately before click.",
+      };
+    }
+
+    if (finalBoundaryInfo.finalBoundary.visibleDialogCount > 0) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok Publish/Post is blocked by a visible dialog; " +
+          "automatic dialog interaction is disabled.",
+      };
+    }
+
+    if (getPublishCandidateScore(finalBoundaryInfo) < 0) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok Publish/Post target qualification changed immediately before click.",
+      };
     }
 
     try {
-      await button.click({ timeout });
-      return true;
-    } catch {
-      // Try the next matching visible button.
-    }
-  }
-
-  return false;
-}
-
-async function dismissInterferingOverlays(page) {
-  // TikTok Studio sometimes opens "content checks" and other hints dialogs
-  // that block the caption field and publish button. Prefer dismissive actions
-  // so the automation does not silently enable optional account settings.
-  const overlayActions = [
-    uiLabels.pattern("tiktokCancel"),
-    uiLabels.pattern("tiktokLater"),
-    uiLabels.pattern("tiktokContinue"),
-    uiLabels.pattern("tiktokClose"),
-  ];
-
-  for (let pass = 0; pass < 5; pass += 1) {
-    let clickedSomething = false;
-    for (const action of overlayActions) {
-      const clicked = await clickFirstVisibleButton(page, action, 1200);
-      if (clicked) {
-        clickedSomething = true;
-        await page.waitForTimeout(400);
-      }
+      actionGuard.consume();
+      await finalTarget.handle.click({ timeout: 5000 });
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "uncertain",
+        retryAllowed: false,
+        clickAttempted: true,
+        reason:
+          "TikTok Publish/Post click had an ambiguous outcome; " +
+          `no retry was attempted. ${error.message}`,
+      };
     }
 
-    const closeIcon = page
-      .locator(uiLabels.attrSelector("button", "aria-label", "tiktokClose"))
-      .first();
-    if ((await closeIcon.count()) > 0) {
-      await closeIcon.click({ timeout: 1200 }).catch(() => { });
-      clickedSomething = true;
-      await page.waitForTimeout(300);
-    }
-
-    if (!clickedSomething) {
-      break;
-    }
-  }
-}
-
-async function scrollToBottom(page) {
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await page.waitForTimeout(600);
-}
-
-async function tryClickPublishButton(page) {
-  // Strategy 1: exact text buttons (most reliable on TikTok Studio)
-  const exactSelectors = [
-    uiLabels.textSelector("button", "tiktokPublish"),
-    uiLabels.textSelector('[role="button"]', "tiktokPublish"),
-  ];
-
-  for (const selector of exactSelectors) {
-    const locator = page.locator(selector);
-    const clicked = await clickFirstLikelyPublishLocator(page, locator);
-    if (clicked) {
-      console.log(`Publish click strategy: exact selector ${selector}`);
-      return true;
-    }
-  }
-
-  // Strategy 2: role-based labels.
-  const roleTexts = [
-    uiLabels.pattern("tiktokPublish"),
-  ];
-
-  for (const textPattern of roleTexts) {
-    const button = page.getByRole("button", { name: textPattern });
-    const clicked = await clickFirstLikelyPublishLocator(page, button);
-    if (clicked) {
-      console.log(`Publish click strategy: role ${textPattern}`);
-      return true;
-    }
-  }
-
-  // Strategy 3: CSS selectors for the red publish button
-  const cssSelectors = [
-    'button[class*="publish" i]',
-    'button[class*="post-btn" i]',
-    'button[class*="submit" i]',
-    'div[class*="publish" i] button',
-    'div[class*="btn-post" i]',
-  ];
-
-  for (const selector of cssSelectors) {
-    const el = page.locator(selector);
-    const clicked = await clickFirstLikelyPublishLocator(page, el);
-    if (clicked) {
-      console.log(`Publish click strategy: css ${selector}`);
-      return true;
-    }
-  }
-
-  // Strategy 4: find by visible text content (any clickable element)
-  const textLabels = uiLabels.terms("tiktokPublish");
-
-  for (const label of textLabels) {
-    const el = page.locator(`text="${label}"`);
-    const clicked = await clickFirstLikelyPublishLocator(page, el);
-    if (clicked) {
-      console.log(`Publish click strategy: text ${label}`);
-      return true;
-    }
-  }
-
-  // Strategy 5: brute-force - find any likely submit element by text.
-  const publishTerms = uiLabels.terms("tiktokPublish").map((term) => term.toLowerCase());
-  const clicked = await page.evaluate((labels) => {
-    const normalize = (value) => String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
-    const normalizedLabels = labels.map(normalize).filter(Boolean);
-    const isPublishText = (text) => {
-      const exactMatch = normalizedLabels.includes(text);
-      const nonAmbiguousMatch = normalizedLabels
-        .filter((label) => label !== "post")
-        .some((label) => text.includes(label));
-      return exactMatch || nonAmbiguousMatch;
+    const { info, score } = finalTarget;
+    const rect = info?.rect || {};
+    console.log(
+      `Publish candidate clicked once: "${normalizeUiText(
+        info?.text || info?.ariaLabel
+      )}" score=${score.toFixed(1)} ` +
+        `rect=${Math.round(Number(rect.left) || 0)},${Math.round(
+          Number(rect.top) || 0
+        )},${Math.round(Number(rect.width) || 0)}x${Math.round(
+          Number(rect.height) || 0
+        )}`
+    );
+    return {
+      ok: true,
+      outcome: "clicked",
+      retryAllowed: false,
+      clickAttempted: true,
     };
-    const isLikelyCandidate = (btn) => {
-      const text = normalize(btn.textContent || btn.getAttribute("aria-label"));
-      if (!text || text === "posts" || !isPublishText(text)) {
-        return false;
-      }
-      if (btn.disabled || btn.getAttribute("aria-disabled") === "true") {
-        return false;
-      }
-      if (
-        btn.closest(
-          "nav, aside, [role='navigation'], [class*='sidebar' i], [class*='side-bar' i], [class*='sidenav' i], [class*='side-nav' i], [class*='menu' i]"
-        )
-      ) {
-        return false;
-      }
-      const anchor = btn.closest("a");
-      const href = normalize(anchor ? anchor.getAttribute("href") : "");
-      if (href && /\/(post|posts|analytics|comment|home|inspiration|monetization|academy|sound|feedback)(\/|$|\?)/i.test(href)) {
-        return false;
-      }
-      const rect = btn.getBoundingClientRect();
-      const mainContentBoundary = window.innerWidth >= 900 ? Math.min(300, window.innerWidth * 0.25) : 0;
-      if (window.innerWidth >= 900 && rect.right <= mainContentBoundary) {
-        return false;
-      }
-      const className = normalize(btn.className || "");
-      const hasPublishCue = /\b(post|publish|submit)\b/.test(className);
-      if (text === "post" && window.innerHeight >= 600 && rect.top < window.innerHeight * 0.5 && !hasPublishCue) {
-        return false;
-      }
-      return true;
-    };
-    const scoreCandidate = (btn) => {
-      const text = normalize(btn.textContent || btn.getAttribute("aria-label"));
-      const rect = btn.getBoundingClientRect();
-      const className = normalize(btn.className || "");
-      let score = 0;
-      if (normalizedLabels.includes(text)) score += 30;
-      if (btn.tagName.toLowerCase() === "button") score += 20;
-      if (normalize(btn.getAttribute("type")) === "submit") score += 20;
-      if (/\b(post|publish|submit)\b/.test(className)) score += 20;
-      if (rect.width >= 80 && rect.height >= 28) score += 15;
-      if (window.innerHeight > 0 && rect.top >= window.innerHeight * 0.5) score += 60;
-      if (window.innerWidth >= 900 && rect.left >= Math.min(300, window.innerWidth * 0.25)) score += 20;
-      score += Math.min(20, Math.max(0, rect.top / 40));
-      return score;
-    };
-
-    const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
-    const candidates = buttons
-      .filter(isLikelyCandidate)
-      .map((btn) => ({ btn, score: scoreCandidate(btn), top: btn.getBoundingClientRect().top }))
-      .sort((a, b) => b.score - a.score || b.top - a.top);
-    if (candidates.length > 0) {
-      candidates[0].btn.scrollIntoView({ block: "center" });
-      candidates[0].btn.click();
-      return true;
+  } finally {
+    await selectedTarget.handle.dispose().catch(() => {});
+    if (finalTarget) {
+      await finalTarget.handle.dispose().catch(() => {});
     }
-    return false;
-  }, publishTerms);
-  if (clicked) {
-    console.log("Publish click strategy: DOM evaluate fallback");
   }
-
-  return clicked;
 }
 
-async function clickPublish(page) {
-  await dismissInterferingOverlays(page);
-
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    await scrollToBottom(page);
-    await page.waitForTimeout(500);
-
-    const clicked = await tryClickPublishButton(page);
-    if (clicked) {
-      console.log(`Publish button clicked on attempt ${attempt + 1}.`);
-      return;
-    }
-
-    await dismissInterferingOverlays(page);
-    await page.waitForTimeout(2000);
-  }
-
-  throw new Error("Could not find an enabled Publish/Post button after 6 attempts.");
+function createPublishActionGuard() {
+  let actionAttempted = false;
+  return {
+    consume() {
+      if (actionAttempted) {
+        throw new Error("TikTok publish action budget is already exhausted.");
+      }
+      actionAttempted = true;
+    },
+    wasAttempted() {
+      return actionAttempted;
+    },
+  };
 }
 
 function hasSuccessCueText(text) {
@@ -947,56 +1085,140 @@ function hasFailureCueText(text) {
   return failurePatterns.some((pattern) => pattern.test(text));
 }
 
-function isLikelyPublishApiResponse(response) {
-  const url = response.url().toLowerCase();
-  const method = response.request().method().toUpperCase();
+function getExpectedOrigin(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyPublishApiResponse(response, expectedOrigin) {
+  const request = response.request();
+  const method = request.method().toUpperCase();
 
   if (!["POST", "PUT", "PATCH"].includes(method)) {
     return false;
   }
 
-  const urlPatterns = [
-    "/publish",
-    "/post",
-    "/aweme",
-    "/upload",
-    "/creator",
-    "/studio",
-    "/web/project",
-    "/web/post",
-  ];
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(response.url());
+  } catch {
+    return false;
+  }
+  const allowedOrigin = expectedOrigin || "https://www.tiktok.com";
+  if (parsedUrl.origin !== allowedOrigin) {
+    return false;
+  }
 
-  return urlPatterns.some((pattern) => url.includes(pattern));
+  const pathname = parsedUrl.pathname.toLowerCase();
+  const unequivocalEndpointPatterns = [
+    /\/publish(?:\/|$)/,
+    /\/post\/publish(?:\/|$)/,
+    /\/web\/project\/post(?:\/|$)/,
+    /\/aweme(?:\/[^/]+)*\/(?:create|commit|publish)(?:\/|$)/,
+  ];
+  if (unequivocalEndpointPatterns.some((pattern) => pattern.test(pathname))) {
+    return true;
+  }
+
+  const contextualPostEndpoint =
+    /\/(?:api\/)?(?:web\/)?post(?:\/|$)/.test(pathname);
+  const postData =
+    typeof request.postData === "function" ? request.postData() || "" : "";
+  return (
+    contextualPostEndpoint &&
+    /\b(?:publish|privacy_level|video_id|project_id|caption)\b/i.test(postData)
+  );
 }
 
 function createPublishResponseTracker(page) {
-  let publishApiSuccess = false;
+  let armed = false;
+  let clickStarted = false;
+  let operationId = null;
+  let expectedOrigin = null;
+  let publishApiSuccess = null;
   let publishApiFailure = null;
+  let startedRequests = new WeakSet();
+
+  const requestHandler = (request) => {
+    if (!armed || !clickStarted) {
+      return;
+    }
+    const candidate = {
+      request: () => request,
+      url: () => request.url(),
+    };
+    if (isLikelyPublishApiResponse(candidate, expectedOrigin)) {
+      startedRequests.add(request);
+    }
+  };
 
   const responseHandler = (response) => {
-    if (!isLikelyPublishApiResponse(response)) {
+    if (!armed || !clickStarted) {
+      return;
+    }
+    const request = response.request();
+    if (
+      !startedRequests.has(request) ||
+      !isLikelyPublishApiResponse(response, expectedOrigin)
+    ) {
       return;
     }
 
     const status = response.status();
     const url = response.url();
+    const method = response.request().method().toUpperCase();
+    const evidence = {
+      type: "http",
+      method,
+      status,
+      url,
+      operationId,
+      expectedOriginMatched: true,
+      requestStartedAfterClick: true,
+      responseCompletedAfterClick: true,
+      currentVideoMatched: false,
+    };
 
     if (status >= 200 && status < 300) {
-      publishApiSuccess = true;
-      console.log(`Publish API success: ${status} ${url}`);
+      publishApiSuccess = evidence;
+      console.log(`Publish API success: ${method} ${status} ${url}`);
       return;
     }
 
     if (status >= 400) {
-      publishApiFailure = `Publish API returned ${status}: ${url}`;
-      console.log(publishApiFailure);
+      publishApiFailure = {
+        ...evidence,
+        reason: `Publish API returned ${status}: ${method} ${url}`,
+      };
+      console.log(publishApiFailure.reason);
     }
   };
 
+  page.on("request", requestHandler);
   page.on("response", responseHandler);
 
   return {
+    arm() {
+      expectedOrigin = getExpectedOrigin(page.url());
+      publishApiSuccess = null;
+      publishApiFailure = null;
+      startedRequests = new WeakSet();
+      clickStarted = false;
+      operationId = null;
+      armed = true;
+    },
+    beginClick(currentOperationId) {
+      if (!armed) {
+        return;
+      }
+      operationId = currentOperationId || null;
+      clickStarted = true;
+    },
     dispose() {
+      page.off("request", requestHandler);
       page.off("response", responseHandler);
     },
     failure() {
@@ -1008,126 +1230,328 @@ function createPublishResponseTracker(page) {
   };
 }
 
-async function trySecondaryPublishConfirm(page) {
-  const confirmTerms = uiLabels
-    .terms("tiktokConfirm")
-    .filter((term) => normalizeUiText(term) !== "post");
-  const confirmPattern = new RegExp(confirmTerms.map(escapeRegExp).join("|"), "i");
-  const scopedConfirmLocator = page
-    .locator(
-      [
-        "[role='dialog']",
-        "[aria-modal='true']",
-        "[class*='modal' i]",
-        "[class*='dialog' i]",
-        "[class*='popover' i]",
-        "[class*='drawer' i]",
-      ].join(", ")
-    )
-    .locator("button, [role='button']")
-    .filter({ hasText: confirmPattern });
-  const scopedClicked = await clickFirstLikelyPublishLocator(
-    page,
-    scopedConfirmLocator,
-    confirmTerms
+function isAuthoritativePublishEvidence(evidence) {
+  return Boolean(
+    evidence &&
+      evidence.type === "http" &&
+      evidence.expectedOriginMatched === true &&
+      evidence.requestStartedAfterClick === true &&
+      evidence.responseCompletedAfterClick === true &&
+      evidence.currentVideoMatched === true &&
+      typeof evidence.operationId === "string" &&
+      evidence.operationId.length > 0 &&
+      typeof evidence.postId === "string" &&
+      evidence.postId.length > 0
   );
-  if (scopedClicked) {
-    await page.waitForTimeout(500);
-    return true;
-  }
-
-  const confirmLocator = page.getByRole("button", {
-    name: confirmPattern,
-  });
-  const clicked = await clickFirstLikelyPublishLocator(
-    page,
-    confirmLocator,
-    confirmTerms
-  );
-  if (clicked) {
-    await page.waitForTimeout(500);
-    return true;
-  }
-
-  return false;
 }
 
-async function waitForPublishConfirmation(page, responseTracker) {
-  const startedUrl = page.url();
-  const tracker = responseTracker || createPublishResponseTracker(page);
-  const ownsTracker = !responseTracker;
-  let primaryRetryCount = 0;
+const PUBLISH_CONFIRMATION_SURFACE_SELECTOR = [
+  "[role='alert']",
+  "[role='status']",
+  "[aria-live='assertive']",
+  "[aria-live='polite']",
+  "[data-e2e*='toast' i]",
+  "[data-testid*='toast' i]",
+  "[class*='toast' i]",
+  "[class*='snackbar' i]",
+  "[class*='notification' i]",
+].join(", ");
+
+async function captureVisiblePublishConfirmationSurfaces(page) {
+  const surfaces = [];
+  const locator = page.locator(PUBLISH_CONFIRMATION_SURFACE_SELECTOR);
+  const count = await locator.count();
 
   try {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      await dismissInterferingOverlays(page);
-
-      const bodyText = await page
-        .locator("body")
-        .innerText()
-        .then((value) => value || "")
-        .catch(() => "");
-      if (hasFailureCueText(bodyText)) {
-        return {
-          ok: false,
-          reason: "TikTok displayed an error after publish click.",
-        };
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth(index);
+      const visible = await candidate
+        .evaluate((element) => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return (
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.visibility !== "collapse" &&
+            Number(style.opacity || "1") > 0 &&
+            rect.width > 0 &&
+            rect.height > 0
+          );
+        })
+        .catch(() => false);
+      if (!visible) {
+        continue;
       }
 
+      const handle = await candidate.elementHandle().catch(() => null);
+      if (!handle) {
+        continue;
+      }
+      const text = await candidate.innerText().catch(() => "");
+      surfaces.push({ handle, text: normalizeUiText(text) });
+    }
+    return surfaces;
+  } catch (error) {
+    await disposeConfirmationSurfaces(surfaces);
+    throw error;
+  }
+}
+
+async function disposeConfirmationSurfaces(surfaces) {
+  await Promise.all(
+    (surfaces || []).map(({ handle }) => handle.dispose().catch(() => {}))
+  );
+}
+
+async function findNewVisibleScopedSuccess(page, baselineSurfaces) {
+  const currentSurfaces =
+    await captureVisiblePublishConfirmationSurfaces(page);
+  try {
+    for (const current of currentSurfaces) {
+      if (!hasSuccessCueText(current.text)) {
+        continue;
+      }
+
+      let existedBeforeClick = false;
+      for (const baseline of baselineSurfaces || []) {
+        const sameElement = await current.handle
+          .evaluate((element, previous) => element === previous, baseline.handle)
+          .catch(() => false);
+        if (sameElement) {
+          existedBeforeClick = true;
+          break;
+        }
+      }
+
+      if (!existedBeforeClick) {
+        return {
+          type: "dom",
+          scope: "publish-confirmation-surface",
+          text: current.text,
+          visible: true,
+          observedAfterClick: true,
+        };
+      }
+    }
+    return null;
+  } finally {
+    await disposeConfirmationSurfaces(currentSurfaces);
+  }
+}
+
+function getAllowlistedPublishNavigation(startedUrl, currentUrl) {
+  let started;
+  let current;
+  try {
+    started = new URL(startedUrl);
+    current = new URL(currentUrl);
+  } catch {
+    return null;
+  }
+
+  const startedWithoutHash = `${started.origin}${started.pathname}${started.search}`;
+  const currentWithoutHash = `${current.origin}${current.pathname}${current.search}`;
+  if (startedWithoutHash === currentWithoutHash) {
+    return null;
+  }
+  if (started.origin !== current.origin) {
+    return null;
+  }
+
+  const successPaths = [
+    /^\/tiktokstudio\/(?:content|posts|manage)(?:\/|$)/i,
+    /^\/creator-center\/(?:content|posts|manage)(?:\/|$)/i,
+  ];
+  if (!successPaths.some((pattern) => pattern.test(current.pathname))) {
+    return null;
+  }
+
+  return {
+    type: "navigation",
+    from: startedWithoutHash,
+    to: currentWithoutHash,
+  };
+}
+
+async function waitForPublishConfirmation(
+  page,
+  responseTracker,
+  {
+    startedUrl = page.url(),
+    baselineSurfaces = [],
+    maxPolls = 30,
+    pollIntervalMs = 2000,
+  } = {}
+) {
+  const tracker = responseTracker || createPublishResponseTracker(page);
+  const ownsTracker = !responseTracker;
+  const safeMaxPolls = Math.max(1, Number(maxPolls) || 1);
+  const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
+  if (ownsTracker && typeof tracker.arm === "function") {
+    tracker.arm();
+  }
+  let lastUnboundHint = null;
+
+  try {
+    for (let poll = 0; poll < safeMaxPolls; poll += 1) {
       const publishApiFailure = tracker.failure();
       if (publishApiFailure) {
         return {
           ok: false,
-          reason: publishApiFailure,
+          outcome: "failure",
+          retryAllowed: false,
+          reason: publishApiFailure.reason || String(publishApiFailure),
+          evidence: publishApiFailure,
         };
       }
 
-      if (tracker.success()) {
+      const publishApiSuccess = tracker.success();
+      if (isAuthoritativePublishEvidence(publishApiSuccess)) {
         return {
           ok: true,
+          outcome: "success",
+          retryAllowed: false,
           reason: "Publish API call succeeded.",
+          evidenceStrength: "strong",
+          evidence: publishApiSuccess,
         };
       }
+      if (publishApiSuccess) {
+        lastUnboundHint = publishApiSuccess;
+      }
 
-      if (hasSuccessCueText(bodyText)) {
+      const bodyText = await readBodyText(page);
+      if (hasFailureCueText(bodyText)) {
         return {
-          ok: true,
-          reason: "Success confirmation text found.",
+          ok: false,
+          outcome: "failure",
+          retryAllowed: false,
+          reason: "TikTok displayed an explicit error after publish click.",
         };
       }
 
-      await trySecondaryPublishConfirm(page);
-
-      if (
-        primaryRetryCount < 2 &&
-        attempt > 0 &&
-        attempt % 5 === 0 &&
-        page.url().includes("/upload")
-      ) {
-        console.log("No publish confirmation yet; retrying the primary TikTok Post button.");
-        const retried = await tryClickPublishButton(page);
-        if (retried) {
-          primaryRetryCount += 1;
-          await page.waitForTimeout(1000);
-        }
+      const scopedSuccess = await findNewVisibleScopedSuccess(
+        page,
+        baselineSurfaces
+      );
+      if (scopedSuccess) {
+        lastUnboundHint = scopedSuccess;
+      }
+      const navigationEvidence = getAllowlistedPublishNavigation(
+        startedUrl,
+        page.url()
+      );
+      if (navigationEvidence) {
+        lastUnboundHint = navigationEvidence;
       }
 
-      const urlChanged = page.url() !== startedUrl;
-      if (urlChanged && !page.url().includes("/upload")) {
-        return {
-          ok: true,
-          reason: `Navigation changed to ${page.url()}.`,
-        };
+      if (poll + 1 < safeMaxPolls) {
+        await page.waitForTimeout(safePollIntervalMs);
       }
-
-      await page.waitForTimeout(2000);
     }
 
     return {
       ok: false,
-      reason: "No reliable publish confirmation observed within timeout.",
+      outcome: "uncertain",
+      retryAllowed: false,
+      reason:
+        "No operation-bound TikTok publish confirmation observed within timeout. " +
+        "Publication may have succeeded; no retry was attempted.",
+      evidence: lastUnboundHint || undefined,
     };
   } finally {
+    if (ownsTracker) {
+      tracker.dispose();
+    }
+  }
+}
+
+async function publishFailClosed(
+  page,
+  responseTracker,
+  {
+    findMaxPolls = 6,
+    findPollIntervalMs = 2000,
+    settleMs = 500,
+    confirmationMaxPolls = 30,
+    confirmationPollIntervalMs = 2000,
+    beforeFinalValidation,
+  } = {}
+) {
+  const overlayState = await detectInterferingOverlays(page);
+  if (overlayState.blocked) {
+    return {
+      ok: false,
+      outcome: "failure",
+      retryAllowed: true,
+      clickAttempted: false,
+      reason:
+        "TikTok Publish/Post is blocked by a visible dialog; " +
+        "automatic dialog interaction is disabled.",
+    };
+  }
+  const baselineBodyText = await readBodyText(page);
+  if (hasFailureCueText(baselineBodyText)) {
+    return {
+      ok: false,
+      outcome: "failure",
+      retryAllowed: true,
+      clickAttempted: false,
+      reason:
+        "TikTok displayed an explicit error before the Publish/Post action.",
+    };
+  }
+
+  const tracker = responseTracker || createPublishResponseTracker(page);
+  const ownsTracker = !responseTracker;
+  const operationId = crypto.randomUUID();
+  let startedUrl = page.url();
+  let baselineSurfaces = [];
+  try {
+    const clickResult = await clickPublishOnce(page, {
+      maxPolls: findMaxPolls,
+      pollIntervalMs: findPollIntervalMs,
+      settleMs,
+      beforeFinalValidation,
+      beforeClick: async () => {
+        baselineSurfaces =
+          await captureVisiblePublishConfirmationSurfaces(page);
+        startedUrl = page.url();
+        if (typeof tracker.arm === "function") {
+          tracker.arm();
+        }
+      },
+      publishResponseTracker: tracker,
+      operationId,
+    });
+    if (!clickResult.ok) {
+      return clickResult;
+    }
+
+    try {
+      const confirmation = await waitForPublishConfirmation(page, tracker, {
+        startedUrl,
+        baselineSurfaces,
+        maxPolls: confirmationMaxPolls,
+        pollIntervalMs: confirmationPollIntervalMs,
+      });
+      return {
+        ...confirmation,
+        clickAttempted: clickResult.clickAttempted,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "uncertain",
+        retryAllowed: false,
+        clickAttempted: clickResult.clickAttempted,
+        reason:
+          "TikTok publish confirmation could not be inspected after the click; " +
+          `no retry was attempted. ${error.message}`,
+      };
+    }
+  } finally {
+    await disposeConfirmationSurfaces(baselineSurfaces);
     if (ownsTracker) {
       tracker.dispose();
     }
@@ -1221,19 +1645,31 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
   let publishResponseTracker = null;
 
   try {
+    if (config.autoAddSound) {
+      throw new Error(
+        "Automatic TikTok sound-panel interaction is disabled by the " +
+          "fail-closed publishing policy."
+      );
+    }
     await gotoUploadPage(page);
     await setVideoFile(page, absoluteVideoPath);
     await waitForUploadReady(page);
     await setCaption(page, caption || config.defaultCaption);
-    await addDefaultSound(page, source).catch((error) => {
-      console.log(`Sound step failed softly: ${error.message}`);
-    });
-    await disableShortContentCheck(page);
     publishResponseTracker = createPublishResponseTracker(page);
-    await clickPublish(page);
-    const confirmation = await waitForPublishConfirmation(page, publishResponseTracker);
+    const confirmation = await publishFailClosed(
+      page,
+      publishResponseTracker
+    );
     if (!confirmation.ok) {
-      throw new Error(`Publish verification failed: ${confirmation.reason}`);
+      const error = new Error(
+        `Publish verification failed: ${confirmation.reason}`
+      );
+      error.outcome = confirmation.outcome;
+      error.retryAllowed = confirmation.retryAllowed;
+      error.reason = confirmation.reason;
+      error.evidence = confirmation.evidence;
+      error.clickAttempted = confirmation.clickAttempted;
+      throw error;
     }
 
     const successScreenshotPath = path.resolve(
@@ -1245,7 +1681,14 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       .catch(() => { });
 
     closeHoldMs = Math.max(config.postPublishHoldMs, 0);
-    return { ok: true };
+    return {
+      ok: true,
+      outcome: "success",
+      retryAllowed: false,
+      reason: confirmation.reason,
+      evidence: confirmation.evidence,
+      clickAttempted: confirmation.clickAttempted,
+    };
   } catch (error) {
     const screenshotPath = path.resolve(
       config.projectRoot,
@@ -1255,7 +1698,15 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
     closeHoldMs = Math.max(config.failureHoldMs, 0);
     return {
       ok: false,
+      outcome: error.outcome || "failure",
+      retryAllowed:
+        typeof error.retryAllowed === "boolean"
+          ? error.retryAllowed
+          : true,
       error: error.message,
+      reason: error.reason || error.message,
+      evidence: error.evidence,
+      clickAttempted: error.clickAttempted,
       screenshotPath,
     };
   } finally {
@@ -1274,9 +1725,19 @@ module.exports = {
   closeLoginSession,
   uploadVideo,
   _private: {
-    dismissInterferingOverlays,
+    clickPublishOnce,
+    collectUniquePublishTargets,
+    createPublishActionGuard,
+    createPublishResponseTracker,
+    detectInterferingOverlays,
+    findUniquePublishTarget,
     getPublishCandidateScore,
+    getAllowlistedPublishNavigation,
+    isLikelyPublishApiResponse,
+    isAuthoritativePublishEvidence,
     isLikelyPublishCandidateInfo,
+    publishFailClosed,
     setCaption,
+    waitForPublishConfirmation,
   },
 };

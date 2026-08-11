@@ -60,8 +60,31 @@ async function moveWithTimestamp(sourcePath, targetDir) {
   return targetPath;
 }
 
+async function writeJsonAtomically(targetPath, value) {
+  const targetDir = path.dirname(targetPath);
+  await fs.mkdir(targetDir, { recursive: true });
+  const tempPath = path.join(
+    targetDir,
+    `.${path.basename(targetPath)}.${process.pid}.${crypto.randomUUID()}.tmp`
+  );
+
+  try {
+    await fs.writeFile(
+      tempPath,
+      `${JSON.stringify(value, null, 2)}\n`,
+      { encoding: "utf8", flag: "wx" }
+    );
+    await fs.rename(tempPath, targetPath);
+  } finally {
+    await fs.unlink(tempPath).catch(() => {});
+  }
+
+  return targetPath;
+}
+
 module.exports = {
   ensureDirectories,
   fileExists,
   moveWithTimestamp,
+  writeJsonAtomically,
 };

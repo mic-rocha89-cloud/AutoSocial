@@ -53,16 +53,18 @@ async function run() {
     )
     .command(
       "post",
-      "Post a specific video or next queue item",
+      "Post the next managed TikTok queue item",
       (builder) =>
         builder
           .option("video", {
             type: "string",
-            describe: "Path to video file. If omitted, takes next item from queue.",
+            describe:
+              "Direct TikTok posting is disabled; place the video in the pending queue.",
           })
           .option("caption", {
             type: "string",
-            describe: "Caption text for manual --video posting.",
+            describe:
+              "Caption text is read from queue sidecars; manual TikTok posting is disabled.",
           }),
       async (argv) => {
         const result = argv.video

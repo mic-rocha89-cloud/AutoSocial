@@ -86,12 +86,8 @@ const LABELS = {
   tiktokPublished: [
     "published",
     "posted",
-    "success",
-    "scheduled",
     "ver\u00f6ffentlicht",
     "veroeffentlicht",
-    "erfolgreich",
-    "geplant",
     "zur prufung eingereicht",
     "zur pr\u00fcfung eingereicht",
   ],
