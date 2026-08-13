@@ -1003,6 +1003,7 @@ async function getPublishCandidateInfo(
       "aside",
       "[role='navigation']",
       "[role='dialog']",
+      "[role='alertdialog']",
       "[aria-modal='true']",
     ].join(", ");
     let structuralBinding = "";
@@ -1063,7 +1064,7 @@ async function getPublishCandidateInfo(
       discardOwner.getAttribute("aria-disabled") !== "true" &&
       !actionRegion.closest(blockedStructuralAncestorSelector);
 
-    if (!structuralBinding && hasVerifiedUploadActionRegion) {
+    if (hasVerifiedUploadActionRegion) {
       structuralBinding = "verified-upload-action-region";
     }
 
@@ -1110,7 +1111,9 @@ async function getPublishCandidateInfo(
       ariaDisabled: clickable.getAttribute("aria-disabled") || "",
       ancestorAside: Boolean(clickable.closest("aside")),
       ancestorDialog: Boolean(
-        clickable.closest('[role="dialog"], [aria-modal="true"]')
+        clickable.closest(
+          '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+        )
       ),
       ancestorForm: Boolean(structuralRoot),
       ancestorMain: Boolean(clickable.closest("main, [role='main']")),
@@ -1131,7 +1134,10 @@ async function getPublishCandidateInfo(
           }
         : null,
       className,
+      dataDisabled: clickable.getAttribute("data-disabled") || "",
       dataE2e: clickable.getAttribute("data-e2e") || "",
+      dataIconOnly: clickable.getAttribute("data-icon-only") || "",
+      dataSize: clickable.getAttribute("data-size") || "",
       dataAttributes,
       dataTestId: clickable.getAttribute("data-testid") || "",
       disabled: Boolean(clickable.disabled) || clickable.getAttribute("aria-disabled") === "true",
@@ -1416,6 +1422,147 @@ async function disposePublishTargets(targets) {
   await Promise.all(
     targets.map(({ handle }) => handle.dispose().catch(() => {}))
   );
+}
+
+function classifyTikTokPublishPreparationInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const reject = (reason) => ({ qualified: false, reason });
+  if (!classifyPublishCandidateInfo(info, publishTerms).qualified) {
+    return reject("publish-candidate-qualification-failed");
+  }
+  if (
+    info.pageOrigin !== TIKTOK_PUBLISH_READINESS.origin ||
+    !/^\/tiktokstudio\/upload\/?$/i.test(info.pagePath || "")
+  ) {
+    return reject("studio-upload-page-mismatch");
+  }
+  if (
+    info.tagName !== "BUTTON" ||
+    normalizeUiText(info.role) !== "button" ||
+    normalizeUiText(info.type) !== "button"
+  ) {
+    return reject("button-semantics-mismatch");
+  }
+  if (
+    info.dataE2e !== "post_video_button" ||
+    info.dataIconOnly !== "false" ||
+    info.dataSize !== "large" ||
+    info.dataDisabled !== "false" ||
+    info.disabled === true
+  ) {
+    return reject("publish-button-attributes-mismatch");
+  }
+  if (
+    info.inNavigation ||
+    info.ancestorAside ||
+    info.ancestorDialog ||
+    info.ancestorMenu ||
+    info.ancestorNav ||
+    info.ancestorNavigation ||
+    info.ancestorSidebar
+  ) {
+    return reject("blocked-structural-ancestor");
+  }
+  if (
+    info.structuralBinding !== "verified-upload-action-region" ||
+    !info.actionRegion ||
+    !normalizeUiText(info.actionRegion.className)
+      .split(/\s+/)
+      .includes("button-group") ||
+    info.actionRegion.postCount !== 1 ||
+    info.actionRegion.discardCount !== 1 ||
+    !(
+      info.actionRegion.footerTagName === "FOOTER" ||
+      normalizeUiText(info.actionRegion.footerClassName)
+        .split(/\s+/)
+        .includes("footer")
+    )
+  ) {
+    return reject("verified-upload-action-region-mismatch");
+  }
+  return { qualified: true, reason: "qualified" };
+}
+
+async function prepareTikTokPublishTargetForQualification(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const candidates = [];
+
+  try {
+    const locator = page.locator('[data-e2e="post_video_button"]');
+    const total = await locator.count();
+    for (let index = 0; index < total; index += 1) {
+      const handle = await getCanonicalPublishOwner(locator.nth(index));
+      if (!handle) {
+        continue;
+      }
+
+      let duplicate = false;
+      for (const candidate of candidates) {
+        const sameOwner = await handle
+          .evaluate((element, other) => element === other, candidate.handle)
+          .catch(() => false);
+        if (sameOwner) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) {
+        await handle.dispose().catch(() => {});
+        continue;
+      }
+
+      const info = await getPublishCandidateInfo(handle).catch(() => null);
+      const classification = classifyTikTokPublishPreparationInfo(
+        info,
+        publishTerms
+      );
+      candidates.push({ handle, info, classification });
+    }
+
+    const qualified = candidates.filter(
+      ({ classification }) => classification.qualified
+    );
+    if (qualified.length !== 1) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "Could not safely prepare the TikTok Publish/Post button: " +
+          `expected exactly one structurally verified target, observed ${qualified.length}.`,
+      };
+    }
+
+    try {
+      await qualified[0].handle.scrollIntoViewIfNeeded({ timeout: 3000 });
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "Could not reveal the structurally verified TikTok Publish/Post " +
+          `button before qualification: ${error.message}`,
+      };
+    }
+
+    return {
+      ok: true,
+      outcome: "prepared",
+      retryAllowed: true,
+      clickAttempted: false,
+    };
+  } finally {
+    await Promise.all(
+      candidates.map(({ handle }) => handle.dispose().catch(() => {}))
+    );
+  }
 }
 
 async function collectUniquePublishTargets(
@@ -1970,7 +2117,10 @@ async function clickPublishOnce(
         "automatic dialog interaction is disabled.",
     };
   }
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  const preparation = await prepareTikTokPublishTargetForQualification(page);
+  if (!preparation.ok) {
+    return preparation;
+  }
   await page.waitForTimeout(Math.max(0, Number(settleMs) || 0));
 
   const resolved = await findUniquePublishTarget(page, {
@@ -1991,18 +2141,6 @@ async function clickPublishOnce(
   let finalTarget = null;
   const actionGuard = createPublishActionGuard();
   try {
-    try {
-      await selectedTarget.handle.scrollIntoViewIfNeeded({ timeout: 3000 });
-    } catch (error) {
-      return {
-        ok: false,
-        outcome: "failure",
-        retryAllowed: true,
-        clickAttempted: false,
-        reason: `Could not prepare the TikTok Publish/Post button before click: ${error.message}`,
-      };
-    }
-
     if (beforeFinalValidation) {
       await beforeFinalValidation();
     }
@@ -2816,6 +2954,7 @@ module.exports = {
   uploadVideo,
   _private: {
     classifyPublishCandidateInfo,
+    classifyTikTokPublishPreparationInfo,
     classifyTikTokPublishReadinessInfo,
     clickPublishOnce,
     collectTikTokPublishReadinessInfo,
@@ -2834,6 +2973,7 @@ module.exports = {
     isAuthoritativePublishEvidence,
     isLikelyPublishCandidateInfo,
     publishFailClosed,
+    prepareTikTokPublishTargetForQualification,
     setCaption,
     waitForTikTokPublishReadiness,
     waitForPublishConfirmation,

@@ -18,6 +18,7 @@ const {
   getPublishCandidateScore,
   isLikelyPublishApiResponse,
   isLikelyPublishCandidateInfo,
+  prepareTikTokPublishTargetForQualification,
   publishFailClosed,
   setCaption,
   waitForPublishConfirmation,
@@ -1018,16 +1019,31 @@ async function createPublishPage(browser, {
     viewport: { width: 1200, height: 900 },
   });
   const button = includeButton
-    ? `<button type="button" id="publish" class="publish-button" onclick="${onClick}">${buttonLabel}</button>`
+    ? `<button
+         type="button"
+         role="button"
+         id="publish"
+         class="publish-button"
+         data-icon-only="false"
+         data-size="large"
+         data-disabled="false"
+         data-e2e="post_video_button"
+         onclick="${onClick}"
+       >${buttonLabel}</button>`
     : "";
   const duplicate = secondButton
-    ? '<button type="button" id="publish-two" class="publish-button">Publish</button>'
+    ? '<button type="button" role="button" id="publish-two" class="publish-button" data-icon-only="false" data-size="large" data-disabled="false" data-e2e="post_video_button">Publish</button>'
     : "";
   const uploadForm = bindToComposer
     ? `<form id="upload-composer">
         <input id="upload-input" type="file" accept="video/*">
-        ${button}
-        ${duplicate}
+        <div class="footer">
+          <div class="button-group">
+            ${button}
+            ${duplicate}
+            <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+          </div>
+        </div>
       </form>`
     : `<form id="upload-composer">
         <input id="upload-input" type="file" accept="video/*">
@@ -1069,6 +1085,7 @@ async function createHydratedStudioPublishPage(browser, {
   contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
   includeDiscard = true,
   musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
+  nestedScrollContainer = false,
   onClick = "window.publishClickCount += 1",
   pathName = "/tiktokstudio/upload",
   uploadPending = false,
@@ -1076,8 +1093,15 @@ async function createHydratedStudioPublishPage(browser, {
   const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
   const document = `
     <style>
-      body { min-height: 1600px; }
-      .button-group { position: absolute; top: 1488px; left: 280px; }
+      ${
+        nestedScrollContainer
+          ? `html, body { height: 1000px; margin: 0; overflow: hidden; }
+             .main-body { height: 932px; left: 0; overflow: auto; position: absolute; top: 68px; width: 1400px; }
+             .layout { height: 1538px; position: relative; }
+             .button-group { position: absolute; top: 1420px; left: 280px; }`
+          : `body { min-height: 1600px; }
+             .button-group { position: absolute; top: 1488px; left: 280px; }`
+      }
       [data-e2e="post_video_button"] { height: 36px; width: 200px; }
     </style>
     <div id="studio-sidebar" data-tt="Sidebar_Sidebar_Clickable">
@@ -1118,6 +1142,45 @@ async function createHydratedStudioPublishPage(browser, {
   );
   await page.goto(`https://www.tiktok.com${pathName}`);
   return page;
+}
+
+async function installPostTargetScrollProbe(page, behavior) {
+  const baseHandle = await page.locator("button").first().elementHandle();
+  const handlePrototype = Object.getPrototypeOf(baseHandle);
+  await baseHandle.dispose();
+  const originalScrollIntoViewIfNeeded =
+    handlePrototype.scrollIntoViewIfNeeded;
+  let calls = 0;
+  const scrolledIds = [];
+
+  handlePrototype.scrollIntoViewIfNeeded = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    if (!isPostTarget) {
+      return originalScrollIntoViewIfNeeded.apply(this, args);
+    }
+
+    calls += 1;
+    scrolledIds.push((await this.getAttribute("id").catch(() => "")) || "");
+    const proceed = () => originalScrollIntoViewIfNeeded.apply(this, args);
+    return behavior
+      ? behavior({ callCount: calls, handle: this, proceed })
+      : proceed();
+  };
+
+  return {
+    get calls() {
+      return calls;
+    },
+    get scrolledIds() {
+      return [...scrolledIds];
+    },
+    restore() {
+      handlePrototype.scrollIntoViewIfNeeded =
+        originalScrollIntoViewIfNeeded;
+    },
+  };
 }
 
 function fastPublishOptions(overrides = {}) {
@@ -1178,6 +1241,410 @@ test("TikTok qualifies the hydrated Studio publish action observed in real DOM",
   } finally {
     await page.close();
   }
+});
+
+test("TikTok reveals the exact final Studio action before visibility-filtered qualification", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser, {
+    nestedScrollContainer: true,
+  });
+  const post = page.locator('[data-e2e="post_video_button"]');
+  const locatorPrototype = Object.getPrototypeOf(post);
+  const postHandle = await post.elementHandle();
+  const handlePrototype = Object.getPrototypeOf(postHandle);
+  await postHandle.dispose();
+  const originalIsVisible = locatorPrototype.isVisible;
+  const originalScrollIntoViewIfNeeded =
+    handlePrototype.scrollIntoViewIfNeeded;
+  let preparationScrolls = 0;
+
+  locatorPrototype.isVisible = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    const preparationComplete = await page
+      .evaluate(() => window.preparationScrollComplete === true)
+      .catch(() => false);
+    if (isPostTarget && !preparationComplete) {
+      return false;
+    }
+    return originalIsVisible.apply(this, args);
+  };
+  handlePrototype.scrollIntoViewIfNeeded = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    if (isPostTarget) {
+      preparationScrolls += 1;
+    }
+    const result = await originalScrollIntoViewIfNeeded.apply(this, args);
+    if (isPostTarget) {
+      await this.evaluate(() => {
+        window.preparationScrollComplete = true;
+      });
+    }
+    return result;
+  };
+
+  try {
+    const before = await post.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const container = document.querySelector(".main-body");
+      return {
+        bodyScrollable:
+          document.documentElement.scrollHeight > window.innerHeight ||
+          document.body.scrollHeight > window.innerHeight,
+        intersectsViewport: rect.bottom > 0 && rect.top < window.innerHeight,
+        scrollableDelta: container.scrollHeight - container.clientHeight,
+        scrollTop: container.scrollTop,
+        top: rect.top,
+      };
+    });
+    assert.deepEqual(before, {
+      bodyScrollable: false,
+      intersectsViewport: false,
+      scrollableDelta: 606,
+      scrollTop: 0,
+      top: 1488,
+    });
+
+    const result = await clickPublishOnce(page, {
+      maxPolls: 1,
+      pollIntervalMs: 0,
+      settleMs: 0,
+    });
+    const after = await post.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const container = document.querySelector(".main-body");
+      return {
+        intersectsViewport: rect.bottom > 0 && rect.top < window.innerHeight,
+        scrollTop: container.scrollTop,
+      };
+    });
+
+    assert.equal(result.outcome, "clicked");
+    assert.equal(result.clickAttempted, true);
+    assert.equal(preparationScrolls, 1);
+    assert.deepEqual(after, {
+      intersectsViewport: true,
+      scrollTop: 606,
+    });
+    assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+  } finally {
+    locatorPrototype.isVisible = originalIsVisible;
+    handlePrototype.scrollIntoViewIfNeeded = originalScrollIntoViewIfNeeded;
+    await page.close();
+  }
+});
+
+test("TikTok final action preparation remains exact and fail closed", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const clickOptions = { maxPolls: 1, pollIntervalMs: 0, settleMs: 0 };
+
+  async function assertZeroClickFailure(page, probe) {
+    const result = await clickPublishOnce(page, clickOptions);
+    assert.equal(result.outcome, "failure");
+    assert.equal(result.retryAllowed, true);
+    assert.equal(result.clickAttempted, false);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    if (probe) {
+      assert.equal(probe.calls, 0);
+    }
+    return result;
+  }
+
+  await t.test("missing structural target receives zero scroll and zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.remove());
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two physical verified targets receive zero ambiguous scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const original = document.querySelector(".button-group");
+      const duplicate = original.cloneNode(true);
+      duplicate.id = "second-preparation-action-group";
+      duplicate.style.left = "520px";
+      original.parentElement.appendChild(duplicate);
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("sidebar Post decoy is never used for preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      document.querySelector('[data-e2e="post_video_button"]').id =
+        "real-studio-post";
+      const sidebar = document.querySelector("#studio-sidebar");
+      sidebar.setAttribute("role", "navigation");
+      sidebar.insertAdjacentHTML(
+        "beforeend",
+        `<div class="footer"><div class="button-group">
+          <button id="sidebar-post-decoy" type="button" role="button"
+            data-icon-only="false" data-size="large" data-disabled="false"
+            data-e2e="post_video_button">Post</button>
+          <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+        </div></div>`
+      );
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "clicked", JSON.stringify(result));
+      assert.equal(result.clickAttempted, true);
+      assert.equal(probe.calls, 1);
+      assert.deepEqual(probe.scrolledIds, ["real-studio-post"]);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("dialog Post target is never used for preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "alertdialog");
+      dialog.style.cssText =
+        "position:fixed;left:400px;top:100px;width:320px;height:200px";
+      dialog.innerHTML = `<div class="footer"><div class="button-group">
+        <button id="dialog-post-decoy" type="button" role="button"
+          data-icon-only="false" data-size="large" data-disabled="false"
+          data-e2e="post_video_button">Post</button>
+        <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+      </div></div>`;
+      document.body.appendChild(dialog);
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("missing paired Discard fails before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      includeDiscard: false,
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two paired Discard controls fail before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const discard = document.querySelector(
+        '[data-e2e="discard_post_button"]'
+      );
+      discard.parentElement.appendChild(discard.cloneNode(true));
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("data-disabled true fails before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.setAttribute("data-disabled", "true"));
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("replacement after scroll is rediscovered and requalified", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.setAttribute("id", "preparation-owner"));
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((original) => {
+          const replacement = original.cloneNode(true);
+          replacement.id = "replacement-after-preparation";
+          original.replaceWith(replacement);
+        });
+      }
+    );
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "clicked");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(probe.calls, 1);
+      assert.equal(await page.locator("#preparation-owner").count(), 0);
+      assert.equal(
+        await page.locator("#replacement-after-preparation").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("target disappearing after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((target) => target.remove());
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /could not find exactly one/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two targets appearing after scroll receive zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((target) => {
+          const original = target.closest(".button-group");
+          const duplicate = original.cloneNode(true);
+          duplicate.id = "late-second-action-group";
+          duplicate.style.left = "520px";
+          original.parentElement.appendChild(duplicate);
+        });
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /multiple distinct active/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("readiness reverting to pending after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ proceed }) => {
+        await proceed();
+        await page.locator(".content-check .check-status").evaluate(
+          (status) => {
+            status.textContent =
+              "Checking in progress. This will take about 10 minutes. Longer videos may take more time.";
+          }
+        );
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /readiness changed immediately before click/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("dialog appearing after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ proceed }) => {
+        await proceed();
+        await page.evaluate(() => {
+          const dialog = document.createElement("div");
+          dialog.id = "late-preparation-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:400px;top:100px;width:320px;height:200px";
+          dialog.textContent = "Unexpected dialog";
+          document.body.appendChild(dialog);
+        });
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("scroll failure is retryable only before any click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(page, async () => {
+      throw new Error("fixture scroll failure");
+    });
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.retryAllowed, true);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /fixture scroll failure/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("production preparation has no alternate action sink", () => {
+    const source = `${prepareTikTokPublishTargetForQualification.toString()} ${clickPublishOnce.toString()}`;
+    assert.equal((source.match(/\.click\s*\(/g) || []).length, 1);
+    assert.doesNotMatch(
+      source,
+      /force\s*:\s*true|mouse\.|Post now|Continue to post|\bCancel\b|window\.scrollTo|css-86gjln|edss2sz6/
+    );
+    assert.match(
+      source,
+      /actionGuard\.consume\(\);\s*await finalTarget\.handle\.click/
+    );
+  });
 });
 
 test("TikTok refuses a primary publish while the real content check is pending", async (t) => {
