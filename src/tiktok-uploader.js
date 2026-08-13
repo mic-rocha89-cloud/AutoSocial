@@ -36,16 +36,16 @@ async function setVideoFile(page, videoPath) {
 }
 
 async function setCaption(page, caption) {
-  if (!caption) {
-    return;
-  }
-
-  const overlayState = await detectInterferingOverlays(page);
-  if (overlayState.blocked) {
+  const onboardingState = await dismissKnownTikTokEditorOnboarding(page);
+  if (onboardingState.blocked) {
     throw new Error(
       "TikTok caption editing is blocked by a visible dialog; " +
         "automatic dialog interaction is disabled."
     );
+  }
+
+  if (!caption) {
+    return;
   }
 
   const candidates = [
@@ -125,6 +125,246 @@ async function clickFirstVisibleEnabledLocator(page, locator) {
 
 function normalizeUiText(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+const KNOWN_TIKTOK_EDITOR_ONBOARDING = Object.freeze({
+  title: "New editing features added",
+  body:
+    "Now it's easier than ever before to create professional and engaging videos.",
+  button: "Got it",
+});
+
+function createKnownOnboardingDismissGuard() {
+  let dismissAttempts = 0;
+  const maxDismissAttempts = 1;
+
+  return {
+    consume() {
+      if (dismissAttempts >= maxDismissAttempts) {
+        throw new Error(
+          "TikTok known onboarding dismiss budget is already exhausted."
+        );
+      }
+      dismissAttempts += 1;
+    },
+  };
+}
+
+async function inspectKnownTikTokEditorOnboarding(
+  dialog,
+  { expectedButton = null, requireOnlyVisibleDialog = false } = {}
+) {
+  return dialog.evaluate(
+    (container, inspection) => {
+      const normalize = (value) =>
+        String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+      const isVisible = (element) => {
+        if (!element?.isConnected) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return (
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+      };
+      const expected = inspection.fingerprint;
+      const expectedDialogText = normalize(
+        `${expected.title} ${expected.body} ${expected.button}`
+      );
+      const descendants = Array.from(container.querySelectorAll("*"));
+      const hasExactVisibleText = (text) =>
+        descendants.some(
+          (element) =>
+            isVisible(element) && normalize(element.innerText) === normalize(text)
+        );
+      const controls = Array.from(
+        container.querySelectorAll("button, [role='button']")
+      );
+      const visibleControls = controls.filter(isVisible);
+      const button = visibleControls.length === 1 ? visibleControls[0] : null;
+      const buttonText = normalize(button?.innerText || button?.textContent);
+      const buttonAriaLabel = normalize(button?.getAttribute("aria-label"));
+      const exactButtonIdentity =
+        buttonText === normalize(expected.button) &&
+        (!buttonAriaLabel || buttonAriaLabel === normalize(expected.button));
+      const visibleDialogs = inspection.requireOnlyVisibleDialog
+        ? Array.from(
+            document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+          ).filter(isVisible)
+        : [];
+      const onlyVisibleDialog =
+        !inspection.requireOnlyVisibleDialog ||
+        (visibleDialogs.length === 1 && visibleDialogs[0] === container);
+      const sameButton = !inspection.expectedButton || button === inspection.expectedButton;
+      const matches =
+        isVisible(container) &&
+        onlyVisibleDialog &&
+        normalize(container.innerText) === expectedDialogText &&
+        hasExactVisibleText(expected.title) &&
+        hasExactVisibleText(expected.body) &&
+        exactButtonIdentity &&
+        sameButton;
+
+      return {
+        buttonIndex: button ? controls.indexOf(button) : -1,
+        matches,
+      };
+    },
+    {
+      expectedButton,
+      fingerprint: KNOWN_TIKTOK_EDITOR_ONBOARDING,
+      requireOnlyVisibleDialog,
+    }
+  );
+}
+
+async function dismissKnownTikTokEditorOnboarding(
+  page,
+  { beforeFinalValidation } = {}
+) {
+  const dialogHandles = await page
+    .locator('[role="dialog"], [aria-modal="true"]')
+    .elementHandles();
+  const controlHandles = [];
+  let dismissAttempted = false;
+
+  try {
+    const visibleDialogs = [];
+    for (const dialog of dialogHandles) {
+      if (await dialog.isVisible().catch(() => false)) {
+        visibleDialogs.push(dialog);
+      }
+    }
+
+    if (visibleDialogs.length === 0) {
+      return {
+        blocked: false,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 0,
+      };
+    }
+
+    if (visibleDialogs.length !== 1) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: visibleDialogs.length,
+      };
+    }
+
+    const dialog = visibleDialogs[0];
+    const recognition = await inspectKnownTikTokEditorOnboarding(dialog, {
+      requireOnlyVisibleDialog: true,
+    }).catch(() => null);
+    if (!recognition?.matches || recognition.buttonIndex < 0) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const controls = await dialog.$$("button, [role='button']");
+    controlHandles.push(...controls);
+    const button = controls[recognition.buttonIndex];
+    if (!button) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    console.log("Known TikTok onboarding dialog detected.");
+
+    const actionable = await button
+      .click({ timeout: 3000, trial: true })
+      .then(() => true)
+      .catch(() => false);
+    if (!actionable) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    if (beforeFinalValidation) {
+      try {
+        await beforeFinalValidation();
+      } catch {
+        return {
+          blocked: true,
+          dismissed: false,
+          dismissAttempted: false,
+          visibleDialogCount: 1,
+        };
+      }
+    }
+
+    const finalValidation = await inspectKnownTikTokEditorOnboarding(dialog, {
+      expectedButton: button,
+      requireOnlyVisibleDialog: true,
+    }).catch(() => null);
+    if (!finalValidation?.matches) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const dismissGuard = createKnownOnboardingDismissGuard();
+    try {
+      dismissGuard.consume();
+      dismissAttempted = true;
+      await button.click({ timeout: 5000 });
+    } catch {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const disappeared = await dialog
+      .waitForElementState("hidden", { timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    const remainingOverlayState = await detectInterferingOverlays(page);
+    if (!disappeared || remainingOverlayState.blocked) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted,
+        visibleDialogCount: remainingOverlayState.visibleDialogCount,
+      };
+    }
+
+    console.log("Known TikTok onboarding dialog dismissed safely.");
+    return {
+      blocked: false,
+      dismissed: true,
+      dismissAttempted,
+      visibleDialogCount: 0,
+    };
+  } finally {
+    await Promise.all(
+      controlHandles.map((control) => control.dispose().catch(() => {}))
+    );
+    await Promise.all(
+      dialogHandles.map((dialog) => dialog.dispose().catch(() => {}))
+    );
+  }
 }
 
 function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
@@ -1730,6 +1970,7 @@ module.exports = {
     createPublishActionGuard,
     createPublishResponseTracker,
     detectInterferingOverlays,
+    dismissKnownTikTokEditorOnboarding,
     findUniquePublishTarget,
     getPublishCandidateScore,
     getAllowlistedPublishNavigation,

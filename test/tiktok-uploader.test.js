@@ -8,6 +8,7 @@ const {
   clickPublishOnce,
   collectUniquePublishTargets,
   detectInterferingOverlays,
+  dismissKnownTikTokEditorOnboarding,
   getPublishCandidateScore,
   isLikelyPublishApiResponse,
   isLikelyPublishCandidateInfo,
@@ -179,6 +180,253 @@ test("TikTok caption flow refuses a blocking dialog without clicking it", async 
     await page.locator("#description").textContent(),
     "generated filename"
   );
+});
+
+const KNOWN_EDITOR_ONBOARDING_TITLE = "New editing features added";
+const KNOWN_EDITOR_ONBOARDING_BODY =
+  "Now it's easier than ever before to create professional and engaging videos.";
+
+function editorOnboardingMarkup({
+  id = "editor-onboarding",
+  title = KNOWN_EDITOR_ONBOARDING_TITLE,
+  body = KNOWN_EDITOR_ONBOARDING_BODY,
+  buttonLabel = "Got it",
+  hidden = false,
+  onClick =
+    "window.onboardingClicks += 1; this.closest('[role=dialog]').remove()",
+} = {}) {
+  return `
+    <div id="${id}" class="test-dialog" role="dialog"${
+      hidden ? ' style="display: none"' : ""
+    }>
+      <h2>${title}</h2>
+      <p>${body}</p>
+      <button type="button" onclick="${onClick}">${buttonLabel}</button>
+    </div>
+  `;
+}
+
+async function createCaptionPage(browser, { content = "", decoy = false } = {}) {
+  const page = await browser.newPage();
+  await page.setContent(`
+    <style>
+      .test-dialog {
+        background: white;
+        height: 240px;
+        left: 300px;
+        position: fixed;
+        top: 120px;
+        width: 360px;
+        z-index: 10;
+      }
+    </style>
+    <div id="description" role="textbox" contenteditable="true">generated filename</div>
+    ${
+      decoy
+        ? '<button id="external-decoy" onclick="window.decoyClicks += 1">Got it</button>'
+        : ""
+    }
+    ${content}
+    <script>
+      window.decoyClicks = 0;
+      window.onboardingClicks = 0;
+      window.publishClickCount = 0;
+      window.unknownDialogClicks = 0;
+    </script>
+  `);
+  return page;
+}
+
+test("TikTok safely dismisses only the exact known editor onboarding", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const caption = "Controlled AutoSocial QA caption.";
+
+  await t.test("exact single onboarding is dismissed once before caption editing", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.locator("#editor-onboarding").count(), 0);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "changed title fails closed",
+      content: editorOnboardingMarkup({
+        title: "New publishing features added",
+      }),
+    },
+    {
+      name: "materially changed body fails closed",
+      content: editorOnboardingMarkup({
+        body: "Review the post and confirm that you accept the updated terms.",
+      }),
+    },
+    {
+      name: "changed button fails closed",
+      content: editorOnboardingMarkup({ buttonLabel: "Continue" }),
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createCaptionPage(browser, { content: scenario.content });
+      try {
+        await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+        assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+        assert.equal(
+          await page.locator("#description").textContent(),
+          "generated filename"
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("external Got it decoy is never selected", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+      decoy: true,
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.evaluate(() => window.decoyClicks), 0);
+      assert.equal(await page.locator("#external-decoy").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known onboarding plus another visible dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        editorOnboardingMarkup() +
+        '<div id="unknown-dialog" class="test-dialog" role="dialog"><button onclick="window.unknownDialogClicks += 1">Close</button></div>',
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two identical onboarding candidates fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        editorOnboardingMarkup({ id: "editor-onboarding-one" }) +
+        editorOnboardingMarkup({ id: "editor-onboarding-two" }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("hidden onboarding remains untouched and is not an active blocker", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({ hidden: true }),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.locator("#editor-onboarding").count(), 1);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("dialog disappearing before final validation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokEditorOnboarding(page, {
+        beforeFinalValidation: async () => {
+          await page.locator("#editor-onboarding").evaluate((dialog) => dialog.remove());
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("button replacement before final validation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokEditorOnboarding(page, {
+        beforeFinalValidation: async () => {
+          await page.locator("#editor-onboarding button").evaluate((button) => {
+            const replacement = button.cloneNode(true);
+            replacement.textContent = "Continue";
+            button.replaceWith(replacement);
+          });
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reappearing onboarding consumes only one dismiss attempt", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({
+        onClick:
+          "window.onboardingClicks += 1; const dialog = this.closest('[role=dialog]'); const replacement = dialog.cloneNode(true); replacement.id = 'editor-onboarding-again'; dialog.replaceWith(replacement)",
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.locator("#editor-onboarding-again").count(), 1);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("automatic content checks dialog remains untouched", async () => {
+    const page = await createCaptionPage(browser, {
+      content: `
+        <div id="automatic-content-checks" class="test-dialog" role="dialog">
+          <h2>Turn on automatic content checks?</h2>
+          <p>Review content for possible issues before publishing.</p>
+          <button onclick="window.unknownDialogClicks += 1">Cancel</button>
+          <button onclick="window.unknownDialogClicks += 1">Turn on</button>
+        </div>
+      `,
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+      assert.equal(await page.locator("#automatic-content-checks").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
 });
 
 test("TikTok final publish boundary has no setup call after owner validation", () => {
@@ -611,6 +859,50 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
       assert.equal(await page.evaluate(() => window.dialogClickCount), 0);
       assert.equal(await page.locator("#late-dialog").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known onboarding appearing at final publish boundary is not dismissed", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.evaluate(
+              ({ title, body }) => {
+                const dialog = document.createElement("div");
+                dialog.id = "late-known-onboarding";
+                dialog.setAttribute("role", "dialog");
+                dialog.style.cssText =
+                  "position:fixed;left:200px;top:100px;width:360px;height:240px";
+                dialog.innerHTML =
+                  `<h2>${title}</h2><p>${body}</p>` +
+                  '<button onclick="window.knownOnboardingClicks += 1; this.parentElement.remove()">Got it</button>';
+                document.body.appendChild(dialog);
+                window.knownOnboardingClicks = 0;
+              },
+              {
+                title: KNOWN_EDITOR_ONBOARDING_TITLE,
+                body: KNOWN_EDITOR_ONBOARDING_BODY,
+              }
+            );
+          },
+          confirmationMaxPolls: 1,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.knownOnboardingClicks), 0);
+      assert.equal(await page.locator("#late-known-onboarding").count(), 1);
       assert.match(result.reason, /blocked by a visible dialog/i);
     } finally {
       await page.close();
