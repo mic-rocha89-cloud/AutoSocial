@@ -36,7 +36,9 @@ async function setVideoFile(page, videoPath) {
 }
 
 async function setCaption(page, caption) {
-  const onboardingState = await dismissKnownTikTokEditorOnboarding(page);
+  const onboardingState = await dismissKnownTikTokPrePublishOnboarding(page, {
+    phase: "pre-caption",
+  });
   if (onboardingState.blocked) {
     throw new Error(
       "TikTok caption editing is blocked by a visible dialog; " +
@@ -127,12 +129,55 @@ function normalizeUiText(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function getPublishClickAttempted(error) {
+  return typeof error?.clickAttempted === "boolean"
+    ? error.clickAttempted
+    : false;
+}
+
 const KNOWN_TIKTOK_EDITOR_ONBOARDING = Object.freeze({
+  id: "editor-features",
   title: "New editing features added",
   body:
     "Now it's easier than ever before to create professional and engaging videos.",
   button: "Got it",
+  allowedPhases: Object.freeze(["pre-caption"]),
+  detectedLog: "Known TikTok onboarding dialog detected.",
+  dismissedLog: "Known TikTok onboarding dialog dismissed safely.",
 });
+
+const KNOWN_TIKTOK_PHONE_PREVIEW_ONBOARDING = Object.freeze({
+  id: "phone-preview",
+  title: "Preview your video on your phone",
+  body: "Now you can view your video as it will appear on TikTok.",
+  button: "Got it",
+  allowedPhases: Object.freeze(["pre-caption"]),
+  detectedLog:
+    "Known TikTok phone-preview onboarding dialog detected.",
+  dismissedLog:
+    "Known TikTok phone-preview onboarding dialog dismissed safely.",
+  reappearedLog:
+    "Known TikTok phone-preview onboarding dialog reappeared after allowed dismiss; failing closed.",
+  structure: Object.freeze({
+    containerTag: "DIV",
+    containerRole: "alertdialog",
+    containerAriaModal: "true",
+    containerClassToken: "react-joyride__tooltip",
+    exactContainerAriaLabel: true,
+    titleClassToken: "tutorial-tooltip__title",
+    bodyClassToken: "tutorial-tooltip__desc",
+    actionFooterClassToken: "tutorial-tooltip__footer",
+    buttonTag: "BUTTON",
+    buttonRole: "button",
+    buttonType: "button",
+    buttonAriaDisabled: "false",
+  }),
+});
+
+const KNOWN_TIKTOK_PRE_PUBLISH_ONBOARDINGS = Object.freeze([
+  KNOWN_TIKTOK_EDITOR_ONBOARDING,
+  KNOWN_TIKTOK_PHONE_PREVIEW_ONBOARDING,
+]);
 
 function createKnownOnboardingDismissGuard() {
   let dismissAttempts = 0;
@@ -150,8 +195,9 @@ function createKnownOnboardingDismissGuard() {
   };
 }
 
-async function inspectKnownTikTokEditorOnboarding(
+async function inspectKnownTikTokOnboarding(
   dialog,
+  fingerprint,
   { expectedButton = null, requireOnlyVisibleDialog = false } = {}
 ) {
   return dialog.evaluate(
@@ -170,15 +216,23 @@ async function inspectKnownTikTokEditorOnboarding(
         );
       };
       const expected = inspection.fingerprint;
+      const structure = expected.structure || {};
       const expectedDialogText = normalize(
         `${expected.title} ${expected.body} ${expected.button}`
       );
+      const expectedAriaLabel = normalize(
+        `${expected.title}${expected.body}${expected.button}`
+      );
       const descendants = Array.from(container.querySelectorAll("*"));
-      const hasExactVisibleText = (text) =>
-        descendants.some(
+      const exactVisibleTextNodes = (text) =>
+        descendants.filter(
           (element) =>
             isVisible(element) && normalize(element.innerText) === normalize(text)
         );
+      const titleNodes = exactVisibleTextNodes(expected.title);
+      const bodyNodes = exactVisibleTextNodes(expected.body);
+      const titleNode = titleNodes.length === 1 ? titleNodes[0] : null;
+      const bodyNode = bodyNodes.length === 1 ? bodyNodes[0] : null;
       const controls = Array.from(
         container.querySelectorAll("button, [role='button']")
       );
@@ -188,10 +242,44 @@ async function inspectKnownTikTokEditorOnboarding(
       const buttonAriaLabel = normalize(button?.getAttribute("aria-label"));
       const exactButtonIdentity =
         buttonText === normalize(expected.button) &&
-        (!buttonAriaLabel || buttonAriaLabel === normalize(expected.button));
+        (!buttonAriaLabel || buttonAriaLabel === normalize(expected.button)) &&
+        !button?.disabled &&
+        normalize(button?.getAttribute("aria-disabled")) !== "true";
+      const hasClassToken = (element, token) =>
+        !token || Boolean(element?.classList?.contains(token));
+      const containerStructureMatches =
+        (!structure.containerTag || container.tagName === structure.containerTag) &&
+        (!structure.containerRole ||
+          container.getAttribute("role") === structure.containerRole) &&
+        (!structure.containerAriaModal ||
+          container.getAttribute("aria-modal") === structure.containerAriaModal) &&
+        hasClassToken(container, structure.containerClassToken) &&
+        (!structure.exactContainerAriaLabel ||
+          normalize(container.getAttribute("aria-label")) === expectedAriaLabel);
+      const textStructureMatches =
+        titleNodes.length === 1 &&
+        bodyNodes.length === 1 &&
+        hasClassToken(titleNode, structure.titleClassToken) &&
+        hasClassToken(bodyNode, structure.bodyClassToken);
+      const actionFooter = structure.actionFooterClassToken
+        ? button?.closest(`.${structure.actionFooterClassToken}`)
+        : null;
+      const buttonStructureMatches =
+        (!structure.buttonTag || button?.tagName === structure.buttonTag) &&
+        (!structure.buttonRole ||
+          button?.getAttribute("role") === structure.buttonRole) &&
+        (!structure.buttonType ||
+          button?.getAttribute("type") === structure.buttonType) &&
+        (!structure.buttonAriaDisabled ||
+          button?.getAttribute("aria-disabled") ===
+            structure.buttonAriaDisabled) &&
+        (!structure.actionFooterClassToken ||
+          (actionFooter && container.contains(actionFooter)));
       const visibleDialogs = inspection.requireOnlyVisibleDialog
         ? Array.from(
-            document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+            document.querySelectorAll(
+              '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+            )
           ).filter(isVisible)
         : [];
       const onlyVisibleDialog =
@@ -202,9 +290,10 @@ async function inspectKnownTikTokEditorOnboarding(
         isVisible(container) &&
         onlyVisibleDialog &&
         normalize(container.innerText) === expectedDialogText &&
-        hasExactVisibleText(expected.title) &&
-        hasExactVisibleText(expected.body) &&
+        containerStructureMatches &&
+        textStructureMatches &&
         exactButtonIdentity &&
+        buttonStructureMatches &&
         sameButton;
 
       return {
@@ -214,18 +303,66 @@ async function inspectKnownTikTokEditorOnboarding(
     },
     {
       expectedButton,
-      fingerprint: KNOWN_TIKTOK_EDITOR_ONBOARDING,
+      fingerprint,
       requireOnlyVisibleDialog,
     }
   );
 }
 
-async function dismissKnownTikTokEditorOnboarding(
+async function recognizeKnownTikTokPrePublishOnboarding(
+  dialog,
+  { phase, expectedButton = null, requireOnlyVisibleDialog = false } = {}
+) {
+  const matches = [];
+
+  for (const fingerprint of KNOWN_TIKTOK_PRE_PUBLISH_ONBOARDINGS) {
+    if (!fingerprint.allowedPhases.includes(phase)) {
+      continue;
+    }
+    const inspection = await inspectKnownTikTokOnboarding(dialog, fingerprint, {
+      expectedButton,
+      requireOnlyVisibleDialog,
+    }).catch(() => null);
+    if (inspection?.matches) {
+      matches.push({ fingerprint, inspection });
+    }
+  }
+
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function hasVisibleKnownTikTokOnboarding(page, fingerprint) {
+  const dialogHandles = await page
+    .locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
+    .elementHandles();
+
+  try {
+    for (const dialog of dialogHandles) {
+      if (!(await dialog.isVisible().catch(() => false))) {
+        continue;
+      }
+      const inspection = await inspectKnownTikTokOnboarding(
+        dialog,
+        fingerprint
+      ).catch(() => null);
+      if (inspection?.matches) {
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    await Promise.all(
+      dialogHandles.map((dialog) => dialog.dispose().catch(() => {}))
+    );
+  }
+}
+
+async function dismissKnownTikTokPrePublishOnboarding(
   page,
-  { beforeFinalValidation } = {}
+  { phase = "pre-caption", beforeFinalValidation } = {}
 ) {
   const dialogHandles = await page
-    .locator('[role="dialog"], [aria-modal="true"]')
+    .locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
     .elementHandles();
   const controlHandles = [];
   let dismissAttempted = false;
@@ -257,10 +394,11 @@ async function dismissKnownTikTokEditorOnboarding(
     }
 
     const dialog = visibleDialogs[0];
-    const recognition = await inspectKnownTikTokEditorOnboarding(dialog, {
+    const recognition = await recognizeKnownTikTokPrePublishOnboarding(dialog, {
+      phase,
       requireOnlyVisibleDialog: true,
     }).catch(() => null);
-    if (!recognition?.matches || recognition.buttonIndex < 0) {
+    if (!recognition || recognition.inspection.buttonIndex < 0) {
       return {
         blocked: true,
         dismissed: false,
@@ -269,9 +407,10 @@ async function dismissKnownTikTokEditorOnboarding(
       };
     }
 
+    const { fingerprint, inspection } = recognition;
     const controls = await dialog.$$("button, [role='button']");
     controlHandles.push(...controls);
-    const button = controls[recognition.buttonIndex];
+    const button = controls[inspection.buttonIndex];
     if (!button) {
       return {
         blocked: true,
@@ -281,7 +420,7 @@ async function dismissKnownTikTokEditorOnboarding(
       };
     }
 
-    console.log("Known TikTok onboarding dialog detected.");
+    console.log(fingerprint.detectedLog);
 
     const actionable = await button
       .click({ timeout: 3000, trial: true })
@@ -309,11 +448,12 @@ async function dismissKnownTikTokEditorOnboarding(
       }
     }
 
-    const finalValidation = await inspectKnownTikTokEditorOnboarding(dialog, {
+    const finalValidation = await recognizeKnownTikTokPrePublishOnboarding(dialog, {
+      phase,
       expectedButton: button,
       requireOnlyVisibleDialog: true,
     }).catch(() => null);
-    if (!finalValidation?.matches) {
+    if (!finalValidation || finalValidation.fingerprint.id !== fingerprint.id) {
       return {
         blocked: true,
         dismissed: false,
@@ -342,6 +482,13 @@ async function dismissKnownTikTokEditorOnboarding(
       .catch(() => false);
     const remainingOverlayState = await detectInterferingOverlays(page);
     if (!disappeared || remainingOverlayState.blocked) {
+      if (
+        disappeared &&
+        fingerprint.reappearedLog &&
+        (await hasVisibleKnownTikTokOnboarding(page, fingerprint))
+      ) {
+        console.log(fingerprint.reappearedLog);
+      }
       return {
         blocked: true,
         dismissed: false,
@@ -350,11 +497,12 @@ async function dismissKnownTikTokEditorOnboarding(
       };
     }
 
-    console.log("Known TikTok onboarding dialog dismissed safely.");
+    console.log(fingerprint.dismissedLog);
     return {
       blocked: false,
       dismissed: true,
       dismissAttempted,
+      onboardingId: fingerprint.id,
       visibleDialogCount: 0,
     };
   } finally {
@@ -365,6 +513,10 @@ async function dismissKnownTikTokEditorOnboarding(
       dialogHandles.map((dialog) => dialog.dispose().catch(() => {}))
     );
   }
+}
+
+async function dismissKnownTikTokEditorOnboarding(page, options = {}) {
+  return dismissKnownTikTokPrePublishOnboarding(page, options);
 }
 
 function classifyPublishCandidateInfo(
@@ -1314,7 +1466,9 @@ async function disableShortContentCheck(page) {
 }
 
 async function detectInterferingOverlays(page) {
-  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const dialogs = page.locator(
+    '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+  );
   const dialogCount = await dialogs.count();
   let visibleDialogCount = 0;
 
@@ -2196,7 +2350,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       error: error.message,
       reason: error.reason || error.message,
       evidence: error.evidence,
-      clickAttempted: error.clickAttempted,
+      clickAttempted: getPublishClickAttempted(error),
       screenshotPath,
     };
   } finally {
@@ -2223,7 +2377,9 @@ module.exports = {
     createPublishResponseTracker,
     detectInterferingOverlays,
     dismissKnownTikTokEditorOnboarding,
+    dismissKnownTikTokPrePublishOnboarding,
     findUniquePublishTarget,
+    getPublishClickAttempted,
     getPublishCandidateScore,
     getAllowlistedPublishNavigation,
     isLikelyPublishApiResponse,

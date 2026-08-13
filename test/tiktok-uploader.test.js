@@ -11,12 +11,20 @@ const {
   collectUniquePublishTargets,
   detectInterferingOverlays,
   dismissKnownTikTokEditorOnboarding,
+  dismissKnownTikTokPrePublishOnboarding,
+  getPublishClickAttempted,
   getPublishCandidateScore,
   isLikelyPublishApiResponse,
   isLikelyPublishCandidateInfo,
   publishFailClosed,
   setCaption,
 } = _private;
+
+test("TikTok pre-publish errors explicitly serialize publish clickAttempted false", () => {
+  assert.equal(getPublishClickAttempted(new Error("pre-publish failure")), false);
+  assert.equal(getPublishClickAttempted({ clickAttempted: false }), false);
+  assert.equal(getPublishClickAttempted({ clickAttempted: true }), true);
+});
 
 test("TikTok publish candidate rejects the Studio sidebar Posts item", () => {
   const candidate = {
@@ -275,6 +283,10 @@ test("TikTok caption flow refuses a blocking dialog without clicking it", async 
 const KNOWN_EDITOR_ONBOARDING_TITLE = "New editing features added";
 const KNOWN_EDITOR_ONBOARDING_BODY =
   "Now it's easier than ever before to create professional and engaging videos.";
+const KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE =
+  "Preview your video on your phone";
+const KNOWN_PHONE_PREVIEW_ONBOARDING_BODY =
+  "Now you can view your video as it will appear on TikTok.";
 
 function editorOnboardingMarkup({
   id = "editor-onboarding",
@@ -292,6 +304,35 @@ function editorOnboardingMarkup({
       <h2>${title}</h2>
       <p>${body}</p>
       <button type="button" onclick="${onClick}">${buttonLabel}</button>
+    </div>
+  `;
+}
+
+function phonePreviewOnboardingMarkup({
+  id = "phone-preview-onboarding",
+  title = KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+  body = KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+  buttonLabel = "Got it",
+  hidden = false,
+  extraButtonMarkup = "",
+  onClick =
+    "window.phonePreviewClicks += 1; this.closest('[aria-modal=true]').remove()",
+} = {}) {
+  return `
+    <div id="${id}" class="react-joyride__tooltip" role="alertdialog" aria-modal="true" aria-label="${title}${body}${buttonLabel}"${
+      hidden ? ' style="display: none"' : ""
+    }>
+      <div>
+        <img alt="" />
+        <div class="tutorial-tooltip__title">${title}</div>
+        <div class="tutorial-tooltip__desc">${body}</div>
+        <div class="tutorial-tooltip__footer">
+          <button type="button" role="button" aria-disabled="false" onclick="${onClick}">
+            <div class="Button__content">${buttonLabel}</div>
+          </button>
+          ${extraButtonMarkup}
+        </div>
+      </div>
     </div>
   `;
 }
@@ -320,12 +361,252 @@ async function createCaptionPage(browser, { content = "", decoy = false } = {}) 
     <script>
       window.decoyClicks = 0;
       window.onboardingClicks = 0;
+      window.phonePreviewClicks = 0;
       window.publishClickCount = 0;
       window.unknownDialogClicks = 0;
     </script>
   `);
   return page;
 }
+
+test("TikTok safely dismisses only the exact phone-preview onboarding", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const caption = "Controlled AutoSocial QA caption.";
+
+  await t.test("exact real-DOM fingerprint can be dismissed before caption editing", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("changed title remains blocked with zero clicks", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        title: "Preview your post on your phone",
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "materially changed body remains blocked with zero clicks",
+      content: phonePreviewOnboardingMarkup({
+        body: "Review your video and accept the updated publishing terms.",
+      }),
+    },
+    {
+      name: "changed action remains blocked with zero clicks",
+      content: phonePreviewOnboardingMarkup({ buttonLabel: "Continue" }),
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createCaptionPage(browser, { content: scenario.content });
+      try {
+        await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+        assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+        assert.equal(
+          await page.locator("#description").textContent(),
+          "generated filename"
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("external Got it decoy is ignored", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+      decoy: true,
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.evaluate(() => window.decoyClicks), 0);
+      assert.equal(await page.locator("#external-decoy").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known phone preview plus another dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        phonePreviewOnboardingMarkup() +
+        '<div id="unknown-dialog" class="test-dialog" role="dialog"><button onclick="window.unknownDialogClicks += 1">Close</button></div>',
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two identical phone-preview dialogs fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        phonePreviewOnboardingMarkup({ id: "phone-preview-one" }) +
+        phonePreviewOnboardingMarkup({ id: "phone-preview-two" }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two Got it buttons inside the dialog fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        extraButtonMarkup:
+          '<button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 100">Got it</button>',
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("hidden phone-preview markup is not interacted with", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({ hidden: true }),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("correct text in an unverified generic dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({
+        title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+        body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("phone preview is refused outside the pre-caption phase", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "final-publish",
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("dialog removed before revalidation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "pre-caption",
+        beforeFinalValidation: async () => {
+          await page.locator("#phone-preview-onboarding").evaluate((dialog) =>
+            dialog.remove()
+          );
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("same-label replacement button receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "pre-caption",
+        beforeFinalValidation: async () => {
+          await page.locator("#phone-preview-onboarding button").evaluate((button) => {
+            button.replaceWith(button.cloneNode(true));
+          });
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reappearing phone preview consumes one dismiss and fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        onClick:
+          "window.phonePreviewClicks += 1; const dialog = this.closest('[aria-modal=true]'); const replacement = dialog.cloneNode(true); replacement.id = 'phone-preview-again'; dialog.replaceWith(replacement)",
+      }),
+    });
+    const messages = [];
+    const originalLog = console.log;
+    console.log = (message) => messages.push(String(message));
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.locator("#phone-preview-again").count(), 1);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+      assert.ok(
+        messages.includes(
+          "Known TikTok phone-preview onboarding dialog reappeared after allowed dismiss; failing closed."
+        )
+      );
+    } finally {
+      console.log = originalLog;
+      await page.close();
+    }
+  });
+});
 
 test("TikTok safely dismisses only the exact known editor onboarding", async (t) => {
   const browser = await chromium.launch({ headless: true });
@@ -1099,6 +1380,56 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
     }
   });
 
+  await t.test("phone preview appearing after publish click is never dismissed", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await page.locator("#publish").evaluate(
+        (button, { title, body }) => {
+          button.addEventListener("click", () => {
+            const dialog = document.createElement("div");
+            dialog.id = "post-click-phone-preview";
+            dialog.className = "react-joyride__tooltip";
+            dialog.setAttribute("role", "alertdialog");
+            dialog.setAttribute("aria-modal", "true");
+            dialog.setAttribute("aria-label", `${title}${body}Got it`);
+            dialog.style.cssText =
+              "position:fixed;left:700px;top:100px;width:280px;height:336px";
+            dialog.innerHTML =
+              `<div class="tutorial-tooltip__title">${title}</div>` +
+              `<div class="tutorial-tooltip__desc">${body}</div>` +
+              '<div class="tutorial-tooltip__footer"><button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 1">Got it</button></div>';
+            document.body.appendChild(dialog);
+          });
+        },
+        {
+          title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+          body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+        }
+      );
+      await page.evaluate(() => {
+        window.phonePreviewClicks = 0;
+      });
+
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 2,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#post-click-phone-preview").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
   await t.test("late visible dialog aborts final publish with zero clicks", async () => {
     const page = await createPublishPage(browser, { buttonLabel: "Publish" });
     try {
@@ -1175,6 +1506,54 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
       assert.equal(await page.evaluate(() => window.knownOnboardingClicks), 0);
       assert.equal(await page.locator("#late-known-onboarding").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("phone preview appearing at final publish boundary is not dismissed", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.evaluate(
+              ({ title, body }) => {
+                const dialog = document.createElement("div");
+                dialog.id = "late-phone-preview";
+                dialog.className = "react-joyride__tooltip";
+                dialog.setAttribute("role", "alertdialog");
+                dialog.setAttribute("aria-modal", "true");
+                dialog.setAttribute("aria-label", `${title}${body}Got it`);
+                dialog.style.cssText =
+                  "position:fixed;left:700px;top:100px;width:280px;height:336px";
+                dialog.innerHTML =
+                  `<div class="tutorial-tooltip__title">${title}</div>` +
+                  `<div class="tutorial-tooltip__desc">${body}</div>` +
+                  '<div class="tutorial-tooltip__footer"><button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 1">Got it</button></div>';
+                document.body.appendChild(dialog);
+                window.phonePreviewClicks = 0;
+              },
+              {
+                title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+                body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+              }
+            );
+          },
+          confirmationMaxPolls: 1,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#late-phone-preview").count(), 1);
       assert.match(result.reason, /blocked by a visible dialog/i);
     } finally {
       await page.close();
