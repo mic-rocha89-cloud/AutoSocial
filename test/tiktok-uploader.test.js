@@ -6,8 +6,10 @@ const { uploadVideo, _private } = require("../src/tiktok-uploader");
 
 const {
   classifyPublishCandidateInfo,
+  classifyTikTokPublishReadinessInfo,
   clickPublishOnce,
   collectPublishCandidateDiagnostics,
+  collectTikTokPublishReadinessInfo,
   collectUniquePublishTargets,
   detectInterferingOverlays,
   dismissKnownTikTokEditorOnboarding,
@@ -18,6 +20,8 @@ const {
   isLikelyPublishCandidateInfo,
   publishFailClosed,
   setCaption,
+  waitForPublishConfirmation,
+  waitForTikTokPublishReadiness,
 } = _private;
 
 test("TikTok pre-publish errors explicitly serialize publish clickAttempted false", () => {
@@ -870,14 +874,145 @@ function createResponseTracker({ success = false, failure = null } = {}) {
   };
 }
 
+const SAFE_MUSIC_CHECK_STATUS = "No issues found.";
+const SAFE_CONTENT_CHECK_STATUS =
+  "No issues found. However, your video could still be removed later if it violates our Community Guidelines.";
+
+function studioChecksMarkup({
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
+  uploadPending = false,
+} = {}) {
+  return `
+    <div class="card checks-card">
+      ${
+        uploadPending
+          ? '<div class="upload-check-gate">Checks can only start after the file is uploaded.</div>'
+          : ""
+      }
+      <div class="checks-sections">
+        <div class="copyright-check">
+          <div data-e2e="copyright_container">Music copyright check</div>
+          <div class="check-status">${musicCheckStatus}</div>
+        </div>
+        <div class="content-check">
+          <div class="headline-wrapper">Content check lite</div>
+          <div class="check-status">${contentCheckStatus}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+const CONTINUE_TO_POST_TITLE = "Continue to post?";
+const CONTINUE_TO_POST_BODY_ONE =
+  "The copyright check is incomplete. Posting your video now will stop the check.";
+const CONTINUE_TO_POST_BODY_TWO =
+  "We're still checking your video for potential issues. Do you want to continue posting before the check is complete?";
+
+async function installContinueToPostDialog(page, {
+  afterPrimary = false,
+  bodyOne = CONTINUE_TO_POST_BODY_ONE,
+  bodyTwo = CONTINUE_TO_POST_BODY_TWO,
+  externalDecoy = false,
+  extraPostNow = false,
+  postNowLabel = "Post now",
+  replaceAfterOpen = false,
+  replacePostNowAfterOpen = false,
+  secondDialog = false,
+  secondaryConfirmClicks = 0,
+  title = CONTINUE_TO_POST_TITLE,
+} = {}) {
+  await page.evaluate(
+    (options) => {
+      window.secondaryConfirmClicks = options.secondaryConfirmClicks;
+      window.secondaryCancelClicks = 0;
+      window.secondaryDecoyClicks = 0;
+      const createDialog = (id) => {
+        const dialog = document.createElement("div");
+        dialog.id = id;
+        dialog.className = "transaction-dialog";
+        dialog.setAttribute("role", "dialog");
+        dialog.setAttribute("aria-modal", "true");
+        dialog.style.cssText =
+          "position:fixed;left:430px;top:200px;width:540px;height:268px;z-index:50";
+        dialog.innerHTML =
+          `<h2>${options.title}</h2>` +
+          `<p>${options.bodyOne}</p>` +
+          `<p>${options.bodyTwo}</p>` +
+          '<button type="button" onclick="window.secondaryCancelClicks += 1">Cancel</button>' +
+          `<button type="button" onclick="window.secondaryConfirmClicks += 1">${options.postNowLabel}</button>` +
+          (options.extraPostNow
+            ? '<button type="button" onclick="window.secondaryConfirmClicks += 100">Post now</button>'
+            : "");
+        document.body.appendChild(dialog);
+        return dialog;
+      };
+      const open = () => {
+        const dialog = createDialog("continue-to-post-dialog");
+        if (options.secondDialog) {
+          createDialog("continue-to-post-dialog-two");
+        }
+        if (options.replaceAfterOpen) {
+          setTimeout(() => {
+            const replacement = dialog.cloneNode(true);
+            replacement.id = "continue-to-post-dialog-replacement";
+            dialog.replaceWith(replacement);
+          }, 5);
+        }
+        if (options.replacePostNowAfterOpen) {
+          setTimeout(() => {
+            const original = Array.from(dialog.querySelectorAll("button")).find(
+              (button) => button.textContent === options.postNowLabel
+            );
+            const replacement = original.cloneNode(true);
+            replacement.id = "replacement-post-now";
+            original.replaceWith(replacement);
+          }, 5);
+        }
+      };
+      if (options.externalDecoy) {
+        const decoy = document.createElement("button");
+        decoy.id = "external-post-now-decoy";
+        decoy.textContent = "Post now";
+        decoy.addEventListener("click", () => {
+          window.secondaryDecoyClicks += 1;
+        });
+        document.body.appendChild(decoy);
+      }
+      if (options.afterPrimary) {
+        document.querySelector("#publish").addEventListener("click", open);
+      } else {
+        open();
+      }
+    },
+    {
+      afterPrimary,
+      bodyOne,
+      bodyTwo,
+      externalDecoy,
+      extraPostNow,
+      postNowLabel,
+      replaceAfterOpen,
+      replacePostNowAfterOpen,
+      secondDialog,
+      secondaryConfirmClicks,
+      title,
+    }
+  );
+}
+
 async function createPublishPage(browser, {
   bodyText = "",
   bindToComposer = true,
   buttonLabel = "Post",
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
   includeButton = true,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
   secondButton = false,
   onClick = "window.publishClickCount += 1",
   statusAttributes = 'role="status"',
+  uploadPending = false,
 } = {}) {
   const page = await browser.newPage({
     viewport: { width: 1200, height: 900 },
@@ -914,6 +1049,7 @@ async function createPublishPage(browser, {
       #publish-two { right: 210px; }
     </style>
     <div id="status" ${statusAttributes}>${bodyText}</div>
+    ${studioChecksMarkup({ contentCheckStatus, musicCheckStatus, uploadPending })}
     ${uploadForm}
     <script>window.publishClickCount = 0;</script>
   `;
@@ -930,9 +1066,12 @@ async function createPublishPage(browser, {
 }
 
 async function createHydratedStudioPublishPage(browser, {
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
   includeDiscard = true,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
   onClick = "window.publishClickCount += 1",
   pathName = "/tiktokstudio/upload",
+  uploadPending = false,
 } = {}) {
   const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
   const document = `
@@ -946,6 +1085,11 @@ async function createHydratedStudioPublishPage(browser, {
     </div>
     <div class="main-body">
       <div class="layout">
+        ${studioChecksMarkup({
+          contentCheckStatus,
+          musicCheckStatus,
+          uploadPending,
+        })}
         <div class="footer">
           <div class="button-group">
             <button
@@ -983,6 +1127,9 @@ function fastPublishOptions(overrides = {}) {
     settleMs: 0,
     confirmationMaxPolls: 3,
     confirmationPollIntervalMs: 10,
+    readinessMaxWaitMs: 20,
+    readinessPollIntervalMs: 1,
+    readinessStablePolls: 1,
     ...overrides,
   };
 }
@@ -1031,6 +1178,506 @@ test("TikTok qualifies the hydrated Studio publish action observed in real DOM",
   } finally {
     await page.close();
   }
+});
+
+test("TikTok refuses a primary publish while the real content check is pending", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser, {
+    musicCheckStatus: "No issues found.",
+    contentCheckStatus:
+      "Checking in progress. This will take about 10 minutes. Longer videos may take more time.",
+  });
+  try {
+    const result = await publishFailClosed(
+      page,
+      createResponseTracker(),
+      fastPublishOptions()
+    );
+
+    assert.equal(result.outcome, "failure");
+    assert.equal(result.retryAllowed, true);
+    assert.equal(result.clickAttempted, false);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    assert.match(result.reason, /checks.*pending/i);
+  } finally {
+    await page.close();
+  }
+});
+
+test("TikTok publish readiness is structural, bounded, and revalidated", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const contentPending =
+    "Checking in progress. This will take about 10 minutes. Longer videos may take more time.";
+
+  await t.test("real pending state becomes eligible only after exact safe state", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+
+      await page.evaluate((safeStatus) => {
+        setTimeout(() => {
+          document.querySelector(".content-check .check-status").textContent =
+            safeStatus;
+        }, 10);
+      }, SAFE_CONTENT_CHECK_STATUS);
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 200,
+        pollIntervalMs: 5,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.outcome, "ready");
+      assert.equal(result.evidence.musicState, "safe");
+      assert.equal(result.evidence.contentState, "safe");
+      assert.equal(result.evidence.qualifiedTargetCount, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("pending checks time out fail closed", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("upload completion message keeps readiness pending", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      uploadPending: true,
+    });
+    try {
+      const result = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(result.status, "pending");
+      assert.equal(result.evidence.uploadState, "pending");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "copyright warning",
+      musicCheckStatus: "Copyright issue found.",
+      expected: "warning",
+    },
+    {
+      name: "copyright check failure",
+      musicCheckStatus: "Unable to complete the copyright check.",
+      expected: "failed",
+    },
+    {
+      name: "unknown content check state",
+      contentCheckStatus: "Analysis queued for later review.",
+      expected: "unknown",
+    },
+  ]) {
+    await t.test(`${scenario.name} fails closed`, async () => {
+      const page = await createHydratedStudioPublishPage(browser, scenario);
+      try {
+        const readiness = classifyTikTokPublishReadinessInfo(
+          await collectTikTokPublishReadinessInfo(page)
+        );
+        assert.equal(readiness.status, scenario.expected);
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("safe check reverting to pending before click aborts", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.locator(".content-check .check-status").evaluate(
+              (status, pendingText) => {
+                status.textContent = pendingText;
+              },
+              contentPending
+            );
+          },
+        })
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /readiness changed immediately before click/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("late dialog during readiness aborts without publish", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      await page.evaluate(() => {
+        setTimeout(() => {
+          const dialog = document.createElement("div");
+          dialog.id = "readiness-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:400px;top:100px;width:320px;height:200px";
+          dialog.textContent = "Unexpected dialog";
+          document.body.appendChild(dialog);
+        }, 10);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 200,
+        pollIntervalMs: 5,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /visible dialog/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("target replaced during readiness is recollected before one click", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      await page.evaluate((safeStatus) => {
+        setTimeout(() => {
+          const original = document.querySelector(
+            '[data-e2e="post_video_button"]'
+          );
+          const replacement = original.cloneNode(true);
+          replacement.id = "readiness-replacement-post";
+          original.replaceWith(replacement);
+          document.querySelector(".content-check .check-status").textContent =
+            safeStatus;
+        }, 10);
+      }, SAFE_CONTENT_CHECK_STATUS);
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          readinessMaxWaitMs: 200,
+          readinessPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.retryAllowed, false);
+      assert.equal(
+        await page.locator("#readiness-replacement-post").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+test("TikTok never bypasses the incomplete-check transaction dialog", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+
+  await t.test("exact dialog after primary click remains untouched and uncertain", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, { afterPrimary: true });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(await page.locator("#continue-to-post-dialog").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("exact stale dialog before primary click fails closed", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page);
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "changed title",
+      title: "Continue publishing?",
+    },
+    {
+      name: "changed body",
+      bodyOne: "Accept the copyright policy before posting.",
+    },
+    {
+      name: "changed action",
+      postNowLabel: "Continue",
+    },
+  ]) {
+    await t.test(`${scenario.name} is an untouched unknown dialog`, async () => {
+      const page = await createPublishPage(browser);
+      try {
+        await installContinueToPostDialog(page, scenario);
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+        assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  for (const scenario of [
+    { name: "external Post now decoy", externalDecoy: true },
+    { name: "two Post now controls", extraPostNow: true },
+    { name: "two visible transaction dialogs", secondDialog: true },
+  ]) {
+    await t.test(`${scenario.name} receives zero clicks`, async () => {
+      const page = await createPublishPage(browser);
+      try {
+        await installContinueToPostDialog(page, scenario);
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+        assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryDecoyClicks), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("dialog replacement after primary click remains untouched", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        replaceAfterOpen: true,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 5,
+          confirmationPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(
+        await page.locator("#continue-to-post-dialog-replacement").count(),
+        1
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("secondary button replacement after primary remains untouched", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        replacePostNowAfterOpen: true,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 5,
+          confirmationPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(await page.locator("#replacement-post-now").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("a consumed secondary budget never permits another click", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        secondaryConfirmClicks: 1,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 1);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("unknown post-click dialog remains untouched and uncertain", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        window.unknownDialogClicks = 0;
+        document.querySelector("#publish").addEventListener("click", () => {
+          const dialog = document.createElement("div");
+          dialog.id = "unknown-post-click-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:430px;top:200px;width:540px;height:268px;z-index:50";
+          dialog.innerHTML =
+            '<h2>Review required</h2><p>Unknown transaction state.</p>' +
+            '<button type="button" onclick="window.unknownDialogClicks += 1">Continue</button>';
+          document.body.appendChild(dialog);
+        });
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+      assert.equal(await page.locator("#unknown-post-click-dialog").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("strong confirmation evidence never triggers dialog interaction", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, { afterPrimary: true });
+      let evidence = null;
+      const tracker = {
+        arm() {
+          evidence = null;
+        },
+        beginClick(operationId) {
+          evidence = {
+            type: "http",
+            expectedOriginMatched: true,
+            requestStartedAfterClick: true,
+            responseCompletedAfterClick: true,
+            currentVideoMatched: true,
+            operationId,
+            postId: "fixture-post-id",
+          };
+        },
+        success() {
+          return evidence;
+        },
+        failure() {
+          return null;
+        },
+        dispose() {},
+      };
+      const result = await publishFailClosed(
+        page,
+        tracker,
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "success");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("production publish path contains no secondary action sink", () => {
+    const source = `${publishFailClosed.toString()} ${waitForPublishConfirmation.toString()}`;
+    assert.doesNotMatch(source, /Post now|Continue to post|secondaryConfirm|tiktokCancel/);
+  });
 });
 
 test("TikTok hydrated Studio binding fails closed when structural proof is incomplete", async (t) => {

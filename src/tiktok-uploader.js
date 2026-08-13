@@ -179,6 +179,350 @@ const KNOWN_TIKTOK_PRE_PUBLISH_ONBOARDINGS = Object.freeze([
   KNOWN_TIKTOK_PHONE_PREVIEW_ONBOARDING,
 ]);
 
+const TIKTOK_PUBLISH_READINESS = Object.freeze({
+  origin: "https://www.tiktok.com",
+  path: "/tiktokstudio/upload",
+  uploadPendingText: "Checks can only start after the file is uploaded.",
+  music: Object.freeze({
+    title: "Music copyright check",
+    selector: '[data-e2e="copyright_container"]',
+    pending: Object.freeze([
+      "We'll check if your video has any unauthorized music that may cause it to be muted.",
+      "Checking in progress. This will take about 30 seconds.",
+    ]),
+    safe: Object.freeze(["No issues found."]),
+  }),
+  content: Object.freeze({
+    title: "Content check lite",
+    selector: ".headline-wrapper",
+    pending: Object.freeze([
+      "We'll check your content for For You Feed eligibility.",
+      "Checking in progress. This will take about 10 minutes. Longer videos may take more time.",
+    ]),
+    safe: Object.freeze([
+      "No issues found. However, your video could still be removed later if it violates our Community Guidelines.",
+    ]),
+  }),
+});
+
+function classifyTikTokCheckState(statusText, fingerprint) {
+  const status = normalizeUiText(statusText);
+  const pending = new Set(fingerprint.pending.map(normalizeUiText));
+  const safe = new Set(fingerprint.safe.map(normalizeUiText));
+
+  if (safe.has(status)) return "safe";
+  if (pending.has(status)) return "pending";
+  if (/\b(?:failed|unable|could not|couldn't)\b/.test(status)) return "failed";
+  if (
+    /\b(?:warning|issues? found|copyright detected|not eligible|restricted|blocked|muted)\b/.test(
+      status
+    )
+  ) {
+    return "warning";
+  }
+  return "unknown";
+}
+
+function classifyTikTokPublishReadinessInfo(info) {
+  if (!info) {
+    return {
+      status: "unknown",
+      reason: "TikTok publish readiness information is unavailable.",
+    };
+  }
+  if (
+    info.pageOrigin !== TIKTOK_PUBLISH_READINESS.origin ||
+    normalizeUiText(info.pagePath) !== TIKTOK_PUBLISH_READINESS.path
+  ) {
+    return {
+      status: "unknown",
+      reason: "TikTok publish readiness was observed outside the exact Studio upload page.",
+      evidence: info,
+    };
+  }
+  if (info.visibleDialogCount > 0) {
+    return {
+      status: "blocked",
+      reason: "TikTok publish readiness is blocked by a visible dialog.",
+      evidence: info,
+    };
+  }
+  if (
+    info.musicAnchorCount !== 1 ||
+    info.contentAnchorCount !== 1 ||
+    info.sameCheckRegion !== true
+  ) {
+    return {
+      status: "unknown",
+      reason: "TikTok publish check structure is missing or ambiguous.",
+      evidence: info,
+    };
+  }
+
+  const musicState = classifyTikTokCheckState(
+    info.musicStatusText,
+    TIKTOK_PUBLISH_READINESS.music
+  );
+  const contentState = classifyTikTokCheckState(
+    info.contentStatusText,
+    TIKTOK_PUBLISH_READINESS.content
+  );
+  const evidence = {
+    ...info,
+    musicState,
+    contentState,
+  };
+
+  if (musicState === "failed" || contentState === "failed") {
+    return {
+      status: "failed",
+      reason: "TikTok reported a failed publish check.",
+      evidence,
+    };
+  }
+  if (musicState === "warning" || contentState === "warning") {
+    return {
+      status: "warning",
+      reason: "TikTok reported a publish check warning.",
+      evidence,
+    };
+  }
+  if (musicState === "unknown" || contentState === "unknown") {
+    return {
+      status: "unknown",
+      reason: "TikTok publish check state is unknown.",
+      evidence,
+    };
+  }
+
+  const uploadState = info.uploadPendingVisible
+    ? "pending"
+    : musicState === "safe" || musicState === "pending"
+      ? "complete"
+      : "unknown";
+  evidence.uploadState = uploadState;
+
+  if (
+    uploadState === "pending" ||
+    musicState === "pending" ||
+    contentState === "pending"
+  ) {
+    return {
+      status: "pending",
+      reason: "TikTok upload or publish checks are still pending.",
+      evidence,
+    };
+  }
+  if (
+    uploadState === "complete" &&
+    musicState === "safe" &&
+    contentState === "safe"
+  ) {
+    return {
+      status: "ready",
+      reason: "TikTok upload and publish checks reached exact safe states.",
+      evidence,
+    };
+  }
+
+  return {
+    status: "unknown",
+    reason: "TikTok publish readiness could not be proven.",
+    evidence,
+  };
+}
+
+async function collectTikTokPublishReadinessInfo(page) {
+  return page.evaluate((fingerprint) => {
+    const normalize = (value) =>
+      String(value || "").trim().replace(/\s+/g, " ");
+    const isVisible = (element) => {
+      if (!element?.isConnected) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+    const exactVisibleAnchors = (selector, title) =>
+      Array.from(document.querySelectorAll(selector)).filter(
+        (element) => isVisible(element) && normalize(element.innerText) === title
+      );
+    const getStatusText = (section, title) => {
+      const text = normalize(section?.innerText);
+      const prefix = `${title} `;
+      return text.startsWith(prefix) ? text.slice(prefix.length) : "";
+    };
+
+    const musicAnchors = exactVisibleAnchors(
+      fingerprint.music.selector,
+      fingerprint.music.title
+    );
+    const contentAnchors = exactVisibleAnchors(
+      fingerprint.content.selector,
+      fingerprint.content.title
+    );
+    const musicSection =
+      musicAnchors.length === 1 ? musicAnchors[0].parentElement : null;
+    const contentSection =
+      contentAnchors.length === 1 ? contentAnchors[0].parentElement : null;
+    const visibleDialogs = Array.from(
+      document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+      )
+    ).filter(isVisible);
+    const uploadPendingVisible = Array.from(
+      document.querySelectorAll("body *")
+    ).some(
+      (element) =>
+        isVisible(element) &&
+        normalize(element.innerText) === fingerprint.uploadPendingText
+    );
+
+    return {
+      contentAnchorCount: contentAnchors.length,
+      contentStatusText: getStatusText(
+        contentSection,
+        fingerprint.content.title
+      ),
+      musicAnchorCount: musicAnchors.length,
+      musicStatusText: getStatusText(musicSection, fingerprint.music.title),
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
+      sameCheckRegion: Boolean(
+        musicSection &&
+          contentSection &&
+          musicSection.parentElement === contentSection.parentElement
+      ),
+      uploadPendingVisible,
+      visibleDialogCount: visibleDialogs.length,
+    };
+  }, TIKTOK_PUBLISH_READINESS);
+}
+
+async function waitForTikTokPublishReadiness(
+  page,
+  {
+    maxWaitMs = 12 * 60 * 1000,
+    pollIntervalMs = 5000,
+    requiredStablePolls = 2,
+  } = {}
+) {
+  const safeMaxWaitMs = Math.max(0, Number(maxWaitMs) || 0);
+  const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
+  const safeRequiredStablePolls = Math.max(
+    1,
+    Number(requiredStablePolls) || 1
+  );
+  const deadline = Date.now() + safeMaxWaitMs;
+  let lastLoggedState = "";
+  let stableSignature = "";
+  let stablePolls = 0;
+
+  while (true) {
+    const info = await collectTikTokPublishReadinessInfo(page).catch(() => null);
+    const readiness = classifyTikTokPublishReadinessInfo(info);
+    const logState = JSON.stringify({
+      content: readiness.evidence?.contentState || "unknown",
+      music: readiness.evidence?.musicState || "unknown",
+      status: readiness.status,
+      upload: readiness.evidence?.uploadState || "unknown",
+    });
+    if (logState !== lastLoggedState) {
+      console.log(`TikTok publish readiness: ${logState}`);
+      lastLoggedState = logState;
+    }
+
+    if (readiness.status === "ready") {
+      const diagnostics = await collectPublishCandidateDiagnostics(page).catch(
+        () => null
+      );
+      if (!diagnostics) {
+        return {
+          ok: false,
+          outcome: "failure",
+          retryAllowed: true,
+          clickAttempted: false,
+          reason: "TikTok publish target readiness could not be inspected.",
+          evidence: readiness.evidence,
+        };
+      }
+      if (diagnostics.qualifiedTargetCount > 1) {
+        return {
+          ok: false,
+          outcome: "failure",
+          retryAllowed: true,
+          clickAttempted: false,
+          reason:
+            "TikTok publish readiness found multiple physical publish targets.",
+          evidence: { readiness: readiness.evidence, diagnostics },
+        };
+      }
+      if (diagnostics.qualifiedTargetCount === 1) {
+        const target = diagnostics.candidates.find(
+          ({ status }) => status === "ACCEPTED"
+        );
+        const signature = JSON.stringify({
+          contentStatusText: readiness.evidence.contentStatusText,
+          dataE2e: target?.dataE2e || "",
+          label: normalizeUiText(target?.text || target?.ariaLabel),
+          musicStatusText: readiness.evidence.musicStatusText,
+          pageOrigin: target?.pageOrigin || "",
+          pagePath: target?.pagePath || "",
+          structuralBinding: target?.structuralBinding || "",
+        });
+        stablePolls = signature === stableSignature ? stablePolls + 1 : 1;
+        stableSignature = signature;
+        if (stablePolls >= safeRequiredStablePolls) {
+          return {
+            ok: true,
+            outcome: "ready",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason: readiness.reason,
+            evidence: {
+              ...readiness.evidence,
+              qualifiedTargetCount: diagnostics.qualifiedTargetCount,
+              stablePolls,
+            },
+          };
+        }
+      } else {
+        stablePolls = 0;
+        stableSignature = "";
+      }
+    } else if (readiness.status !== "pending") {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason: readiness.reason,
+        evidence: readiness.evidence,
+      };
+    } else {
+      stablePolls = 0;
+      stableSignature = "";
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok upload or publish checks remained pending until the bounded readiness timeout.",
+        evidence: readiness.evidence,
+      };
+    }
+    await page.waitForTimeout(safePollIntervalMs);
+  }
+}
+
 function createKnownOnboardingDismissGuard() {
   let dismissAttempts = 0;
   const maxDismissAttempts = 1;
@@ -834,8 +1178,48 @@ async function getPublishCandidateInfo(
       return info;
     }
 
+    const readinessFingerprint = boundaryOptions.readinessFingerprint;
+    const normalizeReadinessText = (value) =>
+      String(value || "").trim().replace(/\s+/g, " ");
+    const isVisibleReadinessElement = (element) => {
+      if (!element?.isConnected) return false;
+      const elementStyle = window.getComputedStyle(element);
+      const elementRect = element.getBoundingClientRect();
+      return (
+        elementStyle.display !== "none" &&
+        elementStyle.visibility !== "hidden" &&
+        elementRect.width > 0 &&
+        elementRect.height > 0
+      );
+    };
+    const exactVisibleReadinessAnchors = (selector, title) =>
+      Array.from(document.querySelectorAll(selector)).filter(
+        (element) =>
+          isVisibleReadinessElement(element) &&
+          normalizeReadinessText(element.innerText) === title
+      );
+    const getReadinessStatusText = (section, title) => {
+      const text = normalizeReadinessText(section?.innerText);
+      const prefix = `${title} `;
+      return text.startsWith(prefix) ? text.slice(prefix.length) : "";
+    };
+    const musicAnchors = exactVisibleReadinessAnchors(
+      readinessFingerprint.music.selector,
+      readinessFingerprint.music.title
+    );
+    const contentAnchors = exactVisibleReadinessAnchors(
+      readinessFingerprint.content.selector,
+      readinessFingerprint.content.title
+    );
+    const musicSection =
+      musicAnchors.length === 1 ? musicAnchors[0].parentElement : null;
+    const contentSection =
+      contentAnchors.length === 1 ? contentAnchors[0].parentElement : null;
+
     const visibleDialogCount = Array.from(
-      document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+      document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+      )
     ).filter((dialog) => {
       const style = window.getComputedStyle(dialog);
       const rect = dialog.getBoundingClientRect();
@@ -847,15 +1231,49 @@ async function getPublishCandidateInfo(
         rect.height > 0
       );
     }).length;
+    const uploadPendingVisible = Array.from(
+      document.querySelectorAll("body *")
+    ).some(
+      (element) =>
+        isVisibleReadinessElement(element) &&
+        normalizeReadinessText(element.innerText) ===
+          readinessFingerprint.uploadPendingText
+    );
+    const publishReadinessInfo = {
+      contentAnchorCount: contentAnchors.length,
+      contentStatusText: getReadinessStatusText(
+        contentSection,
+        readinessFingerprint.content.title
+      ),
+      musicAnchorCount: musicAnchors.length,
+      musicStatusText: getReadinessStatusText(
+        musicSection,
+        readinessFingerprint.music.title
+      ),
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
+      sameCheckRegion: Boolean(
+        musicSection &&
+          contentSection &&
+          musicSection.parentElement === contentSection.parentElement
+      ),
+      uploadPendingVisible,
+      visibleDialogCount,
+    };
 
     return {
       ...info,
       finalBoundary: {
+        publishReadinessInfo,
         sameOwner: clickable === boundaryOptions.originallySelected,
         visibleDialogCount,
       },
     };
-  }, { inspectFinalBoundary, originallySelected });
+  }, {
+    inspectFinalBoundary,
+    originallySelected,
+    readinessFingerprint: TIKTOK_PUBLISH_READINESS,
+  });
 }
 
 async function getCanonicalPublishOwner(candidate) {
@@ -1646,6 +2064,22 @@ async function clickPublishOnce(
       };
     }
 
+    const finalReadiness = classifyTikTokPublishReadinessInfo(
+      finalBoundaryInfo.finalBoundary.publishReadinessInfo
+    );
+    if (finalReadiness.status !== "ready") {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish readiness changed immediately before click: " +
+          finalReadiness.reason,
+        evidence: finalReadiness.evidence,
+      };
+    }
+
     if (getPublishCandidateScore(finalBoundaryInfo) < 0) {
       return {
         ok: false,
@@ -2119,6 +2553,9 @@ async function publishFailClosed(
     settleMs = 500,
     confirmationMaxPolls = 30,
     confirmationPollIntervalMs = 2000,
+    readinessMaxWaitMs = 12 * 60 * 1000,
+    readinessPollIntervalMs = 5000,
+    readinessStablePolls = 2,
     beforeFinalValidation,
   } = {}
 ) {
@@ -2144,6 +2581,15 @@ async function publishFailClosed(
       reason:
         "TikTok displayed an explicit error before the Publish/Post action.",
     };
+  }
+
+  const readiness = await waitForTikTokPublishReadiness(page, {
+    maxWaitMs: readinessMaxWaitMs,
+    pollIntervalMs: readinessPollIntervalMs,
+    requiredStablePolls: readinessStablePolls,
+  });
+  if (!readiness.ok) {
+    return readiness;
   }
 
   const tracker = responseTracker || createPublishResponseTracker(page);
@@ -2370,7 +2816,9 @@ module.exports = {
   uploadVideo,
   _private: {
     classifyPublishCandidateInfo,
+    classifyTikTokPublishReadinessInfo,
     clickPublishOnce,
+    collectTikTokPublishReadinessInfo,
     collectUniquePublishTargets,
     collectPublishCandidateDiagnostics,
     createPublishActionGuard,
@@ -2387,6 +2835,7 @@ module.exports = {
     isLikelyPublishCandidateInfo,
     publishFailClosed,
     setCaption,
+    waitForTikTokPublishReadiness,
     waitForPublishConfirmation,
   },
 };
