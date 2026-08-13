@@ -367,39 +367,44 @@ async function dismissKnownTikTokEditorOnboarding(
   }
 }
 
-function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
+function classifyPublishCandidateInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const reject = (reason) => ({
+    qualified: false,
+    reasons: [reason],
+    score: -1,
+  });
   const visibleText = normalizeUiText(info?.text);
   const ariaLabel = normalizeUiText(info?.ariaLabel);
   const text = visibleText || ariaLabel;
-  if (
-    !text ||
-    info?.disabled ||
-    info?.inNavigation ||
-    !info?.structuralBinding
-  ) {
-    return -1;
-  }
+  if (!info) return reject("candidate-info-unavailable");
+  if (info.visible === false) return reject("invisible");
+  if (!text) return reject("missing-label");
+  if (info.disabled) return reject("disabled");
+  if (info.inNavigation) return reject("inside-navigation");
+  if (!info.structuralBinding) return reject("structural-binding-missing");
 
   const tagName = normalizeUiText(info?.tagName);
   const role = normalizeUiText(info?.role);
   if (!["button", "a"].includes(tagName) && role !== "button") {
-    return -1;
+    return reject("non-semantic-clickable");
   }
 
   const href = normalizeUiText(info?.href);
   if (href && /\/(post|posts|analytics|comment|home|inspiration|monetization|academy|sound|feedback)(\/|$|\?)/i.test(href)) {
-    return -1;
+    return reject("navigation-href");
   }
 
   if (text === "posts") {
-    return -1;
+    return reject("posts-label");
   }
 
   const labels = new Set(publishTerms.map(normalizeUiText).filter(Boolean));
   const identities = new Set([visibleText, ariaLabel].filter(Boolean));
-  if (identities.size !== 1 || !labels.has([...identities][0])) {
-    return -1;
-  }
+  if (identities.size !== 1) return reject("text-aria-mismatch");
+  if (!labels.has([...identities][0])) return reject("label-not-allowlisted");
 
   const rect = info?.rect || {};
   const viewportWidth = Number(info?.viewportWidth) || 0;
@@ -412,7 +417,7 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   const mainContentBoundary = viewportWidth >= 900 ? Math.min(300, viewportWidth * 0.25) : 0;
 
   if (viewportWidth >= 900 && right <= mainContentBoundary) {
-    return -1;
+    return reject("left-of-main-content");
   }
 
   const isBottomAction = viewportHeight > 0 && top >= viewportHeight * 0.5;
@@ -421,7 +426,7 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   const hasPublishCue = /\b(post|publish|submit)\b/.test(className);
 
   if (text === "post" && viewportHeight >= 600 && !isBottomAction && !hasPublishCue) {
-    return -1;
+    return reject("post-outside-bottom-action-without-class-cue");
   }
 
   let score = 0;
@@ -434,7 +439,15 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   if (viewportWidth >= 900 && left >= mainContentBoundary) score += 20;
   score += Math.min(20, Math.max(0, top / 40));
 
-  return score;
+  return {
+    qualified: true,
+    reasons: ["qualified"],
+    score,
+  };
+}
+
+function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
+  return classifyPublishCandidateInfo(info, publishTerms).score;
 }
 
 function isLikelyPublishCandidateInfo(info, publishTerms = uiLabels.terms("tiktokPublish")) {
@@ -448,6 +461,7 @@ async function getPublishCandidateInfo(
   return candidate.evaluate((el, boundaryOptions) => {
     const clickable = el.closest("button, [role='button'], a") || el;
     const rect = clickable.getBoundingClientRect();
+    const style = window.getComputedStyle(clickable);
     const className = (clickable.className || "").toString();
     const dataAttributes = Array.from(clickable.attributes || [])
       .filter((attr) => attr.name.startsWith("data-"))
@@ -478,6 +492,16 @@ async function getPublishCandidateInfo(
       )
     );
     const anchor = clickable.closest("a");
+    const nearestButtonOwner = el.closest("button, [role='button']");
+    const sidebarAncestorSelector = [
+      "[class*='sidebar' i]",
+      "[class*='side-bar' i]",
+      "[class*='sidenav' i]",
+      "[class*='side-nav' i]",
+      "[class*='side_nav' i]",
+      "[data-e2e*='side' i]",
+      "[data-testid*='side' i]",
+    ].join(", ");
     const blockedStructuralAncestorSelector = [
       "nav",
       "aside",
@@ -506,13 +530,131 @@ async function getPublishCandidateInfo(
       }
     }
 
+    const actionRegion = clickable.parentElement;
+    const actionFooter = actionRegion?.parentElement || null;
+    const actionRegionPosts = actionRegion
+      ? Array.from(
+          actionRegion.querySelectorAll('[data-e2e="post_video_button"]')
+        )
+      : [];
+    const actionRegionDiscards = actionRegion
+      ? Array.from(
+          actionRegion.querySelectorAll('[data-e2e="discard_post_button"]')
+        )
+      : [];
+    const discardOwner =
+      actionRegionDiscards.length === 1 ? actionRegionDiscards[0] : null;
+    const hasVerifiedUploadActionRegion =
+      window.location.origin === "https://www.tiktok.com" &&
+      /^\/tiktokstudio\/upload\/?$/i.test(window.location.pathname) &&
+      clickable.tagName === "BUTTON" &&
+      clickable.getAttribute("role") === "button" &&
+      clickable.getAttribute("type") === "button" &&
+      clickable.getAttribute("data-e2e") === "post_video_button" &&
+      clickable.getAttribute("data-icon-only") === "false" &&
+      clickable.getAttribute("data-size") === "large" &&
+      clickable.getAttribute("data-disabled") === "false" &&
+      actionRegion?.classList.contains("button-group") &&
+      Boolean(
+        actionFooter &&
+          (actionFooter.tagName === "FOOTER" ||
+            actionFooter.classList.contains("footer"))
+      ) &&
+      actionRegionPosts.length === 1 &&
+      actionRegionPosts[0] === clickable &&
+      discardOwner?.matches("button, [role='button']") &&
+      !discardOwner.disabled &&
+      discardOwner.getAttribute("aria-disabled") !== "true" &&
+      !actionRegion.closest(blockedStructuralAncestorSelector);
+
+    if (!structuralBinding && hasVerifiedUploadActionRegion) {
+      structuralBinding = "verified-upload-action-region";
+    }
+
+    const describeAncestor = (element, depth) => ({
+      className: (element.className || "").toString(),
+      dataE2e: element.getAttribute("data-e2e") || "",
+      dataTestId: element.getAttribute("data-testid") || "",
+      depth,
+      id: element.id || "",
+      populatedFileInputCount: Array.from(
+        element.querySelectorAll('input[type="file"]')
+      ).filter(
+        (input) =>
+          input.isConnected &&
+          !input.disabled &&
+          input.files &&
+          input.files.length > 0
+      ).length,
+      role: element.getAttribute("role") || "",
+      tagName: element.tagName,
+    });
+    const ancestorChain = [];
+    let currentAncestor = clickable.parentElement;
+    for (
+      let depth = 1;
+      currentAncestor && depth <= 12;
+      depth += 1, currentAncestor = currentAncestor.parentElement
+    ) {
+      ancestorChain.push(describeAncestor(currentAncestor, depth));
+    }
+    const documentPopulatedFileInputCount = Array.from(
+      document.querySelectorAll('input[type="file"]')
+    ).filter(
+      (input) =>
+        input.isConnected &&
+        !input.disabled &&
+        input.files &&
+        input.files.length > 0
+    ).length;
+
     const info = {
+      ancestorChain,
       ariaLabel: clickable.getAttribute("aria-label") || "",
+      ariaDisabled: clickable.getAttribute("aria-disabled") || "",
+      ancestorAside: Boolean(clickable.closest("aside")),
+      ancestorDialog: Boolean(
+        clickable.closest('[role="dialog"], [aria-modal="true"]')
+      ),
+      ancestorForm: Boolean(structuralRoot),
+      ancestorMain: Boolean(clickable.closest("main, [role='main']")),
+      ancestorMenu: Boolean(
+        clickable.closest("[role='menu'], [role='menubar']")
+      ),
+      ancestorNav: Boolean(clickable.closest("nav")),
+      ancestorNavigation: Boolean(clickable.closest("[role='navigation']")),
+      ancestorSection: Boolean(clickable.closest("section")),
+      ancestorSidebar: Boolean(clickable.closest(sidebarAncestorSelector)),
+      actionRegion: actionRegion
+        ? {
+            className: (actionRegion.className || "").toString(),
+            discardCount: actionRegionDiscards.length,
+            footerClassName: (actionFooter?.className || "").toString(),
+            footerTagName: actionFooter?.tagName || "",
+            postCount: actionRegionPosts.length,
+          }
+        : null,
       className,
+      dataE2e: clickable.getAttribute("data-e2e") || "",
       dataAttributes,
+      dataTestId: clickable.getAttribute("data-testid") || "",
       disabled: Boolean(clickable.disabled) || clickable.getAttribute("aria-disabled") === "true",
+      documentPopulatedFileInputCount,
+      formAction: structuralRoot?.getAttribute("action") || "",
       href: anchor ? anchor.getAttribute("href") || "" : "",
+      id: clickable.id || "",
       inNavigation,
+      nearestButtonOwner: nearestButtonOwner
+        ? {
+            ariaLabel: nearestButtonOwner.getAttribute("aria-label") || "",
+            id: nearestButtonOwner.id || "",
+            role: nearestButtonOwner.getAttribute("role") || "",
+            tagName: nearestButtonOwner.tagName,
+            text: nearestButtonOwner.textContent || "",
+          }
+        : null,
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
       rect: {
         left: rect.left,
         right: rect.right,
@@ -526,6 +668,12 @@ async function getPublishCandidateInfo(
       tagName: clickable.tagName,
       type: clickable.getAttribute("type") || "",
       text: clickable.textContent || "",
+      visible:
+        clickable.isConnected &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0,
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
@@ -590,6 +738,108 @@ function getPublishCandidateLocators(page) {
     page.getByRole("button", { name: exactPublishName }),
     page.locator("button, [role='button'], a"),
   ];
+}
+
+function isPublishDiagnosticCandidateInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const labels = publishTerms.map(normalizeUiText).filter(Boolean);
+  const evidence = normalizeUiText(
+    [
+      info?.text,
+      info?.ariaLabel,
+      info?.className,
+      info?.dataAttributes,
+      info?.dataE2e,
+      info?.dataTestId,
+    ].join(" ")
+  );
+  return (
+    normalizeUiText(info?.type) === "submit" ||
+    labels.some((label) => evidence.includes(label)) ||
+    /\b(posts?|publish|submit)\b/.test(evidence)
+  );
+}
+
+async function collectPublishCandidateDiagnostics(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const owners = [];
+  const locatorSources = ["exact-role", "semantic-clickable"];
+
+  try {
+    const locators = getPublishCandidateLocators(page);
+    for (let locatorIndex = 0; locatorIndex < locators.length; locatorIndex += 1) {
+      const locator = locators[locatorIndex];
+      const total = await locator.count();
+      for (let candidateIndex = 0; candidateIndex < total; candidateIndex += 1) {
+        const handle = await getCanonicalPublishOwner(locator.nth(candidateIndex));
+        if (!handle) continue;
+
+        let duplicate = null;
+        for (const owner of owners) {
+          const sameOwner = await handle
+            .evaluate((element, other) => element === other, owner.handle)
+            .catch(() => false);
+          if (sameOwner) {
+            duplicate = owner;
+            break;
+          }
+        }
+
+        if (duplicate) {
+          duplicate.locatorSources.add(locatorSources[locatorIndex]);
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+
+        const info = await getPublishCandidateInfo(handle).catch(() => null);
+        if (!isPublishDiagnosticCandidateInfo(info, publishTerms)) {
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+        owners.push({
+          handle,
+          info,
+          locatorSources: new Set([locatorSources[locatorIndex]]),
+        });
+      }
+    }
+
+    const classified = owners.map((owner) => ({
+      ...owner,
+      classification: classifyPublishCandidateInfo(owner.info, publishTerms),
+    }));
+    const qualifiedTargetCount = classified.filter(
+      ({ classification }) => classification.qualified
+    ).length;
+
+    return {
+      candidateCount: classified.length,
+      qualifiedTargetCount,
+      candidates: classified.map((entry, index) => {
+        const ambiguous =
+          entry.classification.qualified && qualifiedTargetCount !== 1;
+        return {
+          index,
+          status:
+            entry.classification.qualified && !ambiguous
+              ? "ACCEPTED"
+              : "REJECTED",
+          reasons: ambiguous
+            ? ["ambiguous-qualified-duplicate"]
+            : entry.classification.reasons,
+          score: entry.classification.score,
+          locatorSources: [...entry.locatorSources],
+          ...entry.info,
+        };
+      }),
+    };
+  } finally {
+    await Promise.all(owners.map(({ handle }) => handle.dispose().catch(() => {})));
+  }
 }
 
 async function disposePublishTargets(targets) {
@@ -1965,8 +2215,10 @@ module.exports = {
   closeLoginSession,
   uploadVideo,
   _private: {
+    classifyPublishCandidateInfo,
     clickPublishOnce,
     collectUniquePublishTargets,
+    collectPublishCandidateDiagnostics,
     createPublishActionGuard,
     createPublishResponseTracker,
     detectInterferingOverlays,

@@ -5,7 +5,9 @@ const { chromium } = require("playwright");
 const { uploadVideo, _private } = require("../src/tiktok-uploader");
 
 const {
+  classifyPublishCandidateInfo,
   clickPublishOnce,
+  collectPublishCandidateDiagnostics,
   collectUniquePublishTargets,
   detectInterferingOverlays,
   dismissKnownTikTokEditorOnboarding,
@@ -134,6 +136,94 @@ test("TikTok secondary confirm terms reject plain Post and sidebar Posts", () =>
 
   assert.equal(getPublishCandidateScore(sidebar, secondaryTerms), -1);
   assert.equal(getPublishCandidateScore(bottomButton, secondaryTerms), -1);
+});
+
+test("TikTok publish diagnostics explain candidates without clicking", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+
+  await page.setContent(`
+    <style>
+      #valid-publish { bottom: 20px; height: 44px; position: fixed; right: 20px; width: 160px; }
+    </style>
+    <nav id="studio-sidebar">
+      <button id="sidebar-posts" onclick="window.publishDiagnosticClicks += 1">Posts</button>
+      <button id="sidebar-post" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    </nav>
+    <form id="upload-form" action="/tiktokstudio/upload">
+      <input id="upload-input" type="file" accept="video/*">
+      <button
+        id="valid-publish"
+        class="TUXButton publish-button"
+        data-e2e="post_video_button"
+        data-testid="publish-action"
+        type="submit"
+        onclick="event.preventDefault(); window.publishDiagnosticClicks += 1"
+      ><span>Post</span></button>
+    </form>
+    <button id="disabled-post" disabled onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <button id="aria-disabled-post" aria-disabled="true" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <button id="invisible-post" style="display:none" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <script>window.publishDiagnosticClicks = 0;</script>
+  `);
+  await page.locator("#upload-input").setInputFiles({
+    name: "fixture.mp4",
+    mimeType: "video/mp4",
+    buffer: Buffer.from("local fixture"),
+  });
+
+  const diagnostics = await collectPublishCandidateDiagnostics(page);
+  const byId = new Map(diagnostics.candidates.map((candidate) => [candidate.id, candidate]));
+
+  assert.equal(diagnostics.qualifiedTargetCount, 1);
+  assert.equal(byId.get("valid-publish").status, "ACCEPTED");
+  assert.deepEqual(byId.get("valid-publish").reasons, ["qualified"]);
+  assert.deepEqual(byId.get("valid-publish").locatorSources.sort(), [
+    "exact-role",
+    "semantic-clickable",
+  ]);
+  assert.equal(byId.get("valid-publish").tagName, "BUTTON");
+  assert.equal(byId.get("valid-publish").type, "submit");
+  assert.equal(byId.get("valid-publish").structuralBinding, "active-upload-form");
+  assert.equal(byId.get("valid-publish").nearestButtonOwner.tagName, "BUTTON");
+  assert.equal(byId.get("valid-publish").documentPopulatedFileInputCount, 1);
+  assert.equal(
+    byId
+      .get("valid-publish")
+      .ancestorChain.find((ancestor) => ancestor.id === "upload-form")
+      .populatedFileInputCount,
+    1
+  );
+  assert.deepEqual(byId.get("sidebar-posts").reasons, ["inside-navigation"]);
+  assert.deepEqual(byId.get("sidebar-post").reasons, ["inside-navigation"]);
+  assert.deepEqual(byId.get("disabled-post").reasons, ["disabled"]);
+  assert.deepEqual(byId.get("aria-disabled-post").reasons, ["disabled"]);
+  assert.deepEqual(byId.get("invisible-post").reasons, ["invisible"]);
+  assert.equal(await page.evaluate(() => window.publishDiagnosticClicks), 0);
+  assert.doesNotMatch(
+    collectPublishCandidateDiagnostics.toString(),
+    /\.click\(|keyboard\.|mouse\./
+  );
+});
+
+test("TikTok candidate classifier rejects conflicting visible and ARIA identities", () => {
+  const classification = classifyPublishCandidateInfo({
+    ariaLabel: "Delete",
+    disabled: false,
+    inNavigation: false,
+    rect: { left: 900, right: 1060, top: 780, width: 160, height: 44 },
+    role: "",
+    structuralBinding: "active-upload-form",
+    tagName: "button",
+    text: "Post",
+    visible: true,
+    viewportHeight: 900,
+    viewportWidth: 1200,
+  });
+
+  assert.equal(classification.qualified, false);
+  assert.deepEqual(classification.reasons, ["text-aria-mismatch"]);
 });
 
 test("TikTok caption flow refuses a blocking dialog without clicking it", async (t) => {
@@ -558,6 +648,53 @@ async function createPublishPage(browser, {
   return page;
 }
 
+async function createHydratedStudioPublishPage(browser, {
+  includeDiscard = true,
+  onClick = "window.publishClickCount += 1",
+  pathName = "/tiktokstudio/upload",
+} = {}) {
+  const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
+  const document = `
+    <style>
+      body { min-height: 1600px; }
+      .button-group { position: absolute; top: 1488px; left: 280px; }
+      [data-e2e="post_video_button"] { height: 36px; width: 200px; }
+    </style>
+    <div id="studio-sidebar" data-tt="Sidebar_Sidebar_Clickable">
+      <button type="button">Posts</button>
+    </div>
+    <div class="main-body">
+      <div class="layout">
+        <div class="footer">
+          <div class="button-group">
+            <button
+              type="button"
+              role="button"
+              class="Button__root Button__root--size-large Button__root--type-primary"
+              data-icon-only="false"
+              data-size="large"
+              data-disabled="false"
+              data-e2e="post_video_button"
+              onclick="${onClick}"
+            ><span>Post</span></button>
+            ${
+              includeDiscard
+                ? '<button type="button" role="button" data-e2e="discard_post_button">Discard</button>'
+                : ""
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>window.publishClickCount = 0;</script>
+  `;
+  await page.route("https://www.tiktok.com/**", (route) =>
+    route.fulfill({ contentType: "text/html", body: document })
+  );
+  await page.goto(`https://www.tiktok.com${pathName}`);
+  return page;
+}
+
 function fastPublishOptions(overrides = {}) {
   return {
     findMaxPolls: 1,
@@ -587,6 +724,107 @@ test("TikTok final publish rejects composite transactional actions", async (t) =
   } finally {
     await page.close();
   }
+});
+
+test("TikTok qualifies the hydrated Studio publish action observed in real DOM", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser);
+  try {
+    const diagnostics = await collectPublishCandidateDiagnostics(page);
+    const postCandidate = diagnostics.candidates.find(
+      ({ dataE2e }) => dataE2e === "post_video_button"
+    );
+    assert.equal(postCandidate.status, "ACCEPTED");
+    assert.equal(postCandidate.structuralBinding, "verified-upload-action-region");
+    assert.equal(diagnostics.qualifiedTargetCount, 1);
+
+    const result = await clickPublishOnce(page, {
+      maxPolls: 1,
+      pollIntervalMs: 0,
+      settleMs: 0,
+    });
+    assert.equal(result.outcome, "clicked");
+    assert.equal(result.clickAttempted, true);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+  } finally {
+    await page.close();
+  }
+});
+
+test("TikTok hydrated Studio binding fails closed when structural proof is incomplete", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const clickOptions = { maxPolls: 1, pollIntervalMs: 0, settleMs: 0 };
+
+  for (const scenario of [
+    {
+      name: "paired Discard action is missing",
+      options: { includeDiscard: false },
+    },
+    {
+      name: "same action region is outside the Studio upload path",
+      options: { pathName: "/tiktokstudio/content" },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createHydratedStudioPublishPage(
+        browser,
+        scenario.options
+      );
+      try {
+        const diagnostics = await collectPublishCandidateDiagnostics(page);
+        const postCandidate = diagnostics.candidates.find(
+          ({ dataE2e }) => dataE2e === "post_video_button"
+        );
+        assert.equal(postCandidate.status, "REJECTED");
+        assert.deepEqual(postCandidate.reasons, ["structural-binding-missing"]);
+        assert.equal(diagnostics.qualifiedTargetCount, 0);
+
+        const result = await clickPublishOnce(page, clickOptions);
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("two physical verified action regions remain ambiguous", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "second-physical-action-group";
+        duplicate.style.left = "520px";
+        original.parentElement.appendChild(duplicate);
+      });
+
+      const diagnostics = await collectPublishCandidateDiagnostics(page);
+      const verifiedPosts = diagnostics.candidates.filter(
+        ({ dataE2e }) => dataE2e === "post_video_button"
+      );
+      assert.equal(verifiedPosts.length, 2);
+      assert.equal(diagnostics.qualifiedTargetCount, 2);
+      assert.ok(
+        verifiedPosts.every(
+          ({ status, reasons }) =>
+            status === "REJECTED" &&
+            reasons.length === 1 &&
+            reasons[0] === "ambiguous-qualified-duplicate"
+        )
+      );
+
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
 });
 
 test("TikTok publish target requires exact identity and active composer binding", async (t) => {
@@ -822,6 +1060,40 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
       assert.equal(await page.evaluate(() => window.dialogClickCount), 0);
       assert.equal(await page.locator("#initial-dialog").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("automatic content checks dialog blocks final publish without interaction", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      await page.evaluate(() => {
+        const dialog = document.createElement("div");
+        dialog.id = "automatic-content-checks";
+        dialog.setAttribute("role", "dialog");
+        dialog.style.cssText =
+          "position:fixed;left:200px;top:100px;width:360px;height:240px";
+        dialog.innerHTML =
+          "<h2>Turn on automatic content checks?</h2>" +
+          '<button onclick="window.contentCheckClicks += 1">Cancel</button>' +
+          '<button onclick="window.contentCheckClicks += 1">Turn on</button>';
+        document.body.appendChild(dialog);
+        window.contentCheckClicks = 0;
+      });
+
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.contentCheckClicks), 0);
+      assert.equal(await page.locator("#automatic-content-checks").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
     } finally {
       await page.close();
     }
