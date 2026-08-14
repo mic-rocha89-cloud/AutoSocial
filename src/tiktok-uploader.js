@@ -1635,6 +1635,162 @@ async function collectUniquePublishTargets(
   }
 }
 
+async function collectTikTokPublishTargetResolutionDiagnostics(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const directLocator = page.locator('[data-e2e="post_video_button"]');
+  const [publishRoleLocator, semanticClickableLocator] =
+    getPublishCandidateLocators(page);
+  const ownerHandles = [];
+  const candidateOwners = [];
+  let finalTargets = [];
+  const errors = [];
+
+  const safeCount = async (locator, field) => {
+    try {
+      return await locator.count();
+    } catch (error) {
+      errors.push({ field, error: error.message });
+      return null;
+    }
+  };
+
+  const directPostCount = await safeCount(directLocator, "directPostCount");
+  const publishRoleCount = await safeCount(
+    publishRoleLocator,
+    "publishRoleCount"
+  );
+  const semanticClickableCount = await safeCount(
+    semanticClickableLocator,
+    "semanticClickableCount"
+  );
+  const targets = [];
+
+  try {
+    for (let index = 0; index < (directPostCount || 0); index += 1) {
+      const locator = directLocator.nth(index);
+      let playwrightVisible = null;
+      let playwrightVisibilityError = "";
+      try {
+        playwrightVisible = await locator.isVisible();
+      } catch (error) {
+        playwrightVisibilityError = error.message;
+      }
+
+      const owner = await getCanonicalPublishOwner(locator);
+      candidateOwners.push(owner);
+      if (owner) {
+        ownerHandles.push(owner);
+      }
+
+      let info = null;
+      let candidateInfoError = "";
+      if (owner) {
+        try {
+          info = await getPublishCandidateInfo(owner);
+        } catch (error) {
+          candidateInfoError = error.message;
+        }
+      }
+
+      const classification = classifyPublishCandidateInfo(info, publishTerms);
+      const preparationClassification =
+        classifyTikTokPublishPreparationInfo(info, publishTerms);
+      targets.push({
+        physicalIndex: index,
+        playwrightVisible,
+        playwrightVisibilityError: playwrightVisibilityError || undefined,
+        canonicalOwnerObtained: Boolean(owner),
+        candidateInfoAvailable: Boolean(info),
+        candidateInfoError: candidateInfoError || undefined,
+        classification: {
+          qualified: classification.qualified,
+          reasons: classification.reasons,
+          score: classification.score,
+        },
+        preparationClassification: {
+          qualified: preparationClassification.qualified,
+          reason: preparationClassification.reason,
+        },
+        normalizedText: normalizeUiText(info?.text),
+        normalizedAriaLabel: normalizeUiText(info?.ariaLabel),
+        tagName: info?.tagName || "",
+        role: info?.role || "",
+        type: info?.type || "",
+        dataE2e: info?.dataE2e || "",
+        dataIconOnly: info?.dataIconOnly || "",
+        dataSize: info?.dataSize || "",
+        dataDisabled: info?.dataDisabled || "",
+        disabled: info?.disabled ?? null,
+        infoVisible: info?.visible ?? null,
+        rect: info?.rect || null,
+        viewportWidth: info?.viewportWidth ?? null,
+        viewportHeight: info?.viewportHeight ?? null,
+        structuralBinding: info?.structuralBinding || "",
+        actionRegion: info?.actionRegion
+          ? {
+              className: info.actionRegion.className,
+              postCount: info.actionRegion.postCount,
+              discardCount: info.actionRegion.discardCount,
+              footerTagName: info.actionRegion.footerTagName,
+              footerClassName: info.actionRegion.footerClassName,
+            }
+          : null,
+        ancestors: {
+          inNavigation: info?.inNavigation ?? null,
+          nav: info?.ancestorNav ?? null,
+          navigation: info?.ancestorNavigation ?? null,
+          sidebar: info?.ancestorSidebar ?? null,
+          aside: info?.ancestorAside ?? null,
+          dialog: info?.ancestorDialog ?? null,
+          menu: info?.ancestorMenu ?? null,
+        },
+        pageOrigin: info?.pageOrigin || "",
+        pagePath: info?.pagePath || "",
+        reachedFinalTargets: false,
+      });
+    }
+
+    try {
+      finalTargets = await collectUniquePublishTargets(page, publishTerms);
+    } catch (error) {
+      errors.push({ field: "finalTargetCount", error: error.message });
+    }
+
+    for (let index = 0; index < targets.length; index += 1) {
+      const owner = candidateOwners[index];
+      if (!owner) {
+        continue;
+      }
+      for (const finalTarget of finalTargets) {
+        const sameOwner = await owner
+          .evaluate((element, other) => element === other, finalTarget.handle)
+          .catch(() => false);
+        if (sameOwner) {
+          targets[index].reachedFinalTargets = true;
+          break;
+        }
+      }
+    }
+
+    return {
+      schemaVersion: 1,
+      directPostCount,
+      publishRoleCount,
+      semanticClickableCount,
+      finalTargetCount: finalTargets.length,
+      targets,
+      errors,
+    };
+  } finally {
+    await Promise.all(
+      ownerHandles.map((handle) => handle.dispose().catch(() => {}))
+    );
+    await disposePublishTargets(finalTargets);
+  }
+}
+
 async function addDefaultSound(page, source) {
   if (source === "instant-post") {
     console.log("Skipping auto-add sound: Post triggered via Instant Post (video already has sound).");
@@ -2085,11 +2241,29 @@ async function findUniquePublishTarget(
     }
   }
 
+  const diagnostics = await collectTikTokPublishTargetResolutionDiagnostics(
+    page
+  ).catch((error) => ({
+    schemaVersion: 1,
+    directPostCount: null,
+    publishRoleCount: null,
+    semanticClickableCount: null,
+    finalTargetCount: null,
+    targets: [],
+    errors: [{ field: "diagnosticCollection", error: error.message }],
+  }));
+  console.log(
+    `TikTok publish target resolution diagnostics: ${JSON.stringify(
+      diagnostics
+    )}`
+  );
+
   return {
     status: "none",
     count: 0,
     reason:
       "Could not find exactly one enabled TikTok Publish/Post button before any click.",
+    diagnostics,
   };
 }
 
@@ -2134,6 +2308,7 @@ async function clickPublishOnce(
       retryAllowed: true,
       clickAttempted: false,
       reason: resolved.reason,
+      ...(resolved.diagnostics ? { diagnostics: resolved.diagnostics } : {}),
     };
   }
 
@@ -2957,6 +3132,7 @@ module.exports = {
     classifyTikTokPublishPreparationInfo,
     classifyTikTokPublishReadinessInfo,
     clickPublishOnce,
+    collectTikTokPublishTargetResolutionDiagnostics,
     collectTikTokPublishReadinessInfo,
     collectUniquePublishTargets,
     collectPublishCandidateDiagnostics,

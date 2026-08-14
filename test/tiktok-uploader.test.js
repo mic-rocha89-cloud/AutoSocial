@@ -9,11 +9,13 @@ const {
   classifyTikTokPublishReadinessInfo,
   clickPublishOnce,
   collectPublishCandidateDiagnostics,
+  collectTikTokPublishTargetResolutionDiagnostics,
   collectTikTokPublishReadinessInfo,
   collectUniquePublishTargets,
   detectInterferingOverlays,
   dismissKnownTikTokEditorOnboarding,
   dismissKnownTikTokPrePublishOnboarding,
+  findUniquePublishTarget,
   getPublishClickAttempted,
   getPublishCandidateScore,
   isLikelyPublishApiResponse,
@@ -1644,6 +1646,446 @@ test("TikTok final action preparation remains exact and fail closed", async (t) 
       source,
       /actionGuard\.consume\(\);\s*await finalTarget\.handle\.click/
     );
+  });
+});
+
+test("TikTok post-scroll target resolution diagnostics are exact and read only", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const diagnosticPrefix =
+    "TikTok publish target resolution diagnostics: ";
+
+  async function withPostVisibilityOverride(page, visible, run) {
+    const locatorPrototype = Object.getPrototypeOf(
+      page.locator('[data-e2e="post_video_button"]')
+    );
+    const originalIsVisible = locatorPrototype.isVisible;
+    locatorPrototype.isVisible = async function (...args) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      return isPostTarget
+        ? visible
+        : originalIsVisible.apply(this, args);
+    };
+    try {
+      return await run();
+    } finally {
+      locatorPrototype.isVisible = originalIsVisible;
+    }
+  }
+
+  async function installActiveUploadForm(page) {
+    await page.evaluate(() => {
+      const layout = document.querySelector(".layout");
+      const form = document.createElement("form");
+      const input = document.createElement("input");
+      const transfer = new DataTransfer();
+      transfer.items.add(
+        new File(["fixture"], "fixture.mp4", { type: "video/mp4" })
+      );
+      input.type = "file";
+      input.files = transfer.files;
+      layout.before(form);
+      form.append(input, layout);
+    });
+  }
+
+  async function captureResolutionLogs(run) {
+    const originalConsoleLog = console.log;
+    const logs = [];
+    console.log = (...args) => logs.push(args.map(String).join(" "));
+    try {
+      return { result: await run(), logs };
+    } finally {
+      console.log = originalConsoleLog;
+    }
+  }
+
+  await t.test("separates Playwright visibility from DOM info visibility", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const diagnostics = await withPostVisibilityOverride(
+        page,
+        false,
+        () => collectTikTokPublishTargetResolutionDiagnostics(page)
+      );
+      assert.equal(diagnostics.directPostCount, 1);
+      assert.equal(diagnostics.targets.length, 1);
+      assert.equal(diagnostics.targets[0].playwrightVisible, false);
+      assert.equal(diagnostics.targets[0].infoVisible, true);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.qualified,
+        true
+      );
+      assert.equal(diagnostics.targets[0].reachedFinalTargets, false);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reports an absent direct Studio selector", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => target.remove());
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.directPostCount, 0);
+      assert.equal(diagnostics.targets.length, 0);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reports when the canonical owner cannot be obtained", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const locatorPrototype = Object.getPrototypeOf(page.locator("button"));
+    const originalEvaluateHandle = locatorPrototype.evaluateHandle;
+    locatorPrototype.evaluateHandle = async function (...args) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      if (isPostTarget) {
+        throw new Error("fixture canonical owner unavailable");
+      }
+      return originalEvaluateHandle.apply(this, args);
+    };
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].canonicalOwnerObtained, false);
+      assert.equal(diagnostics.targets[0].candidateInfoAvailable, false);
+      assert.deepEqual(diagnostics.targets[0].classification.reasons, [
+        "candidate-info-unavailable",
+      ]);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      locatorPrototype.evaluateHandle = originalEvaluateHandle;
+      await page.close();
+    }
+  });
+
+  await t.test("reports candidate info collection failure separately", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const sampleHandle = await page.locator("button").first().elementHandle();
+    const handlePrototype = Object.getPrototypeOf(sampleHandle);
+    await sampleHandle.dispose();
+    const originalEvaluate = handlePrototype.evaluate;
+    handlePrototype.evaluate = async function (callback, argument, ...rest) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      if (
+        isPostTarget &&
+        argument &&
+        Object.prototype.hasOwnProperty.call(argument, "inspectFinalBoundary")
+      ) {
+        throw new Error("fixture candidate info unavailable");
+      }
+      return originalEvaluate.call(this, callback, argument, ...rest);
+    };
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].canonicalOwnerObtained, true);
+      assert.equal(diagnostics.targets[0].candidateInfoAvailable, false);
+      assert.match(
+        diagnostics.targets[0].candidateInfoError,
+        /fixture candidate info unavailable/
+      );
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      handlePrototype.evaluate = originalEvaluate;
+      await page.close();
+    }
+  });
+
+  await t.test("preserves the candidate classifier rejection reason", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => {
+          target.textContent = "Schedule";
+        });
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, false);
+      assert.deepEqual(diagnostics.targets[0].classification.reasons, [
+        "label-not-allowlisted",
+      ]);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-candidate-qualification-failed"
+      );
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("preserves the stricter preparation classifier reason", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await installActiveUploadForm(page);
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => target.setAttribute("data-size", "small"));
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.qualified,
+        false
+      );
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-button-attributes-mismatch"
+      );
+      assert.equal(diagnostics.targets[0].dataSize, "small");
+      assert.equal(diagnostics.finalTargetCount, 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("captures attributes changed after successful preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const preparation =
+        await prepareTikTokPublishTargetForQualification(page);
+      assert.equal(preparation.ok, true);
+      await installActiveUploadForm(page);
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) =>
+          target.setAttribute("data-disabled", "true")
+        );
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(diagnostics.targets[0].dataDisabled, "true");
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-button-attributes-mismatch"
+      );
+      assert.equal(diagnostics.finalTargetCount, 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("records a fully qualified direct target and locator counts", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      const [target] = diagnostics.targets;
+      assert.equal(diagnostics.directPostCount, 1);
+      assert.equal(diagnostics.publishRoleCount, 1);
+      assert.equal(diagnostics.semanticClickableCount, 3);
+      assert.equal(diagnostics.finalTargetCount, 1);
+      assert.equal(target.canonicalOwnerObtained, true);
+      assert.equal(target.candidateInfoAvailable, true);
+      assert.equal(target.classification.qualified, true);
+      assert.equal(target.preparationClassification.qualified, true);
+      assert.equal(target.normalizedText, "post");
+      assert.equal(target.normalizedAriaLabel, "");
+      assert.equal(target.tagName, "BUTTON");
+      assert.equal(target.role, "button");
+      assert.equal(target.type, "button");
+      assert.equal(target.dataE2e, "post_video_button");
+      assert.equal(target.infoVisible, true);
+      assert.ok(target.rect);
+      assert.equal(target.structuralBinding, "verified-upload-action-region");
+      assert.equal(target.actionRegion.postCount, 1);
+      assert.equal(target.actionRegion.discardCount, 1);
+      assert.equal(target.ancestors.dialog, false);
+      assert.equal(target.pageOrigin, "https://www.tiktok.com");
+      assert.equal(target.pagePath, "/tiktokstudio/upload");
+      assert.equal(target.reachedFinalTargets, true);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("records multiple physical and final qualified targets", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "diagnostic-second-action-group";
+        duplicate.style.left = "520px";
+        original.parentElement.appendChild(duplicate);
+      });
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.directPostCount, 2);
+      assert.equal(diagnostics.publishRoleCount, 2);
+      assert.equal(diagnostics.finalTargetCount, 2);
+      assert.equal(diagnostics.targets.length, 2);
+      assert.ok(
+        diagnostics.targets.every(
+          (target) =>
+            target.classification.qualified &&
+            target.preparationClassification.qualified &&
+            target.reachedFinalTargets
+        )
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("never clicks or mutates the inspected DOM", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const before = await page.evaluate(() => ({
+        html: document.documentElement.outerHTML,
+        nodes: document.querySelectorAll("*").length,
+      }));
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      const after = await page.evaluate(() => ({
+        html: document.documentElement.outerHTML,
+        nodes: document.querySelectorAll("*").length,
+      }));
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.deepEqual(after, before);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("never invokes target scrolling", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      nestedScrollContainer: true,
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(probe.calls, 0);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("never writes scrollTop", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      nestedScrollContainer: true,
+    });
+    try {
+      await page.evaluate(() => {
+        const container = document.querySelector(".main-body");
+        let currentScrollTop = container.scrollTop;
+        window.diagnosticScrollTopWrites = 0;
+        Object.defineProperty(container, "scrollTop", {
+          configurable: true,
+          get: () => currentScrollTop,
+          set: (value) => {
+            window.diagnosticScrollTopWrites += 1;
+            currentScrollTop = value;
+          },
+        });
+      });
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(
+        await page.evaluate(() => window.diagnosticScrollTopWrites),
+        0
+      );
+      const source =
+        collectTikTokPublishTargetResolutionDiagnostics.toString();
+      assert.doesNotMatch(
+        source,
+        /\.click\s*\(|scrollIntoViewIfNeeded|scrollTop\s*=|\.focus\s*\(|\.fill\s*\(|\.press\s*\(|dispatchEvent|setAttribute|replaceWith/
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("none status keeps semantics and clickAttempted false", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const { resolution, click } = await withPostVisibilityOverride(
+        page,
+        false,
+        async () => ({
+          resolution: await captureResolutionLogs(() =>
+            findUniquePublishTarget(page, {
+              maxPolls: 1,
+              pollIntervalMs: 0,
+            })
+          ),
+          click: await captureResolutionLogs(() =>
+            clickPublishOnce(page, {
+              maxPolls: 1,
+              pollIntervalMs: 0,
+              settleMs: 0,
+            })
+          ),
+        })
+      );
+      const expectedReason =
+        "Could not find exactly one enabled TikTok Publish/Post button before any click.";
+      assert.equal(resolution.result.status, "none");
+      assert.equal(resolution.result.count, 0);
+      assert.equal(resolution.result.reason, expectedReason);
+      assert.equal(click.result.outcome, "failure");
+      assert.equal(click.result.retryAllowed, true);
+      assert.equal(click.result.clickAttempted, false);
+      assert.equal(click.result.reason, expectedReason);
+      assert.equal(click.result.diagnostics.directPostCount, 1);
+      assert.equal(click.result.diagnostics.finalTargetCount, 0);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(
+        resolution.logs.filter((entry) => entry.startsWith(diagnosticPrefix))
+          .length,
+        1
+      );
+      assert.equal(
+        click.logs.filter((entry) => entry.startsWith(diagnosticPrefix)).length,
+        1
+      );
+      assert.doesNotThrow(() =>
+        JSON.parse(
+          click.logs
+            .find((entry) => entry.startsWith(diagnosticPrefix))
+            .slice(diagnosticPrefix.length)
+        )
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("successful resolution does not collect or log diagnostics", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    let resolved;
+    try {
+      const captured = await captureResolutionLogs(() =>
+        findUniquePublishTarget(page, {
+          maxPolls: 1,
+          pollIntervalMs: 0,
+        })
+      );
+      resolved = captured.result;
+      assert.equal(resolved.status, "unique");
+      assert.equal("diagnostics" in resolved, false);
+      assert.equal(
+        captured.logs.some((entry) => entry.startsWith(diagnosticPrefix)),
+        false
+      );
+    } finally {
+      await resolved?.target?.handle?.dispose().catch(() => {});
+      await page.close();
+    }
   });
 });
 
