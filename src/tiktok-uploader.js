@@ -135,6 +135,21 @@ function getPublishClickAttempted(error) {
     : false;
 }
 
+function buildTikTokUploadFailureResult(error, screenshotPath) {
+  return {
+    ok: false,
+    outcome: error.outcome || "failure",
+    retryAllowed:
+      typeof error.retryAllowed === "boolean" ? error.retryAllowed : true,
+    error: error.message,
+    reason: error.reason || error.message,
+    evidence: error.evidence,
+    diagnostics: error.diagnostics,
+    clickAttempted: getPublishClickAttempted(error),
+    screenshotPath,
+  };
+}
+
 const KNOWN_TIKTOK_EDITOR_ONBOARDING = Object.freeze({
   id: "editor-features",
   title: "New editing features added",
@@ -210,6 +225,7 @@ function classifyTikTokCheckState(statusText, fingerprint) {
   const pending = new Set(fingerprint.pending.map(normalizeUiText));
   const safe = new Set(fingerprint.safe.map(normalizeUiText));
 
+  if (!status) return "hydrating";
   if (safe.has(status)) return "safe";
   if (pending.has(status)) return "pending";
   if (/\b(?:failed|unable|could not|couldn't)\b/.test(status)) return "failed";
@@ -223,50 +239,121 @@ function classifyTikTokCheckState(statusText, fingerprint) {
   return "unknown";
 }
 
+function createTikTokReadinessClassification({
+  status,
+  phase,
+  reasonCode,
+  reason,
+  evidence,
+}) {
+  return {
+    status,
+    phase,
+    reasonCode,
+    reason,
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
 function classifyTikTokPublishReadinessInfo(info) {
   if (!info) {
-    return {
+    return createTikTokReadinessClassification({
       status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "readiness-info-unavailable",
       reason: "TikTok publish readiness information is unavailable.",
-    };
+    });
   }
   if (
     info.pageOrigin !== TIKTOK_PUBLISH_READINESS.origin ||
     normalizeUiText(info.pagePath) !== TIKTOK_PUBLISH_READINESS.path
   ) {
-    return {
+    return createTikTokReadinessClassification({
       status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "studio-upload-page-mismatch",
       reason: "TikTok publish readiness was observed outside the exact Studio upload page.",
       evidence: info,
-    };
+    });
   }
-  if (info.visibleDialogCount > 0) {
-    return {
+  const visibleDialogCount = info.visibleDialogCount;
+  if (
+    !Number.isInteger(visibleDialogCount) ||
+    visibleDialogCount < 0 ||
+    typeof info.uploadPendingVisible !== "boolean"
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-readiness-observation",
+      reason: "TikTok publish readiness observation is incomplete.",
+      evidence: info,
+    });
+  }
+  if (visibleDialogCount > 0) {
+    return createTikTokReadinessClassification({
       status: "blocked",
+      phase: "blocked",
+      reasonCode: "visible-dialog",
       reason: "TikTok publish readiness is blocked by a visible dialog.",
       evidence: info,
-    };
-  }
-  if (
-    info.musicAnchorCount !== 1 ||
-    info.contentAnchorCount !== 1 ||
-    info.sameCheckRegion !== true
-  ) {
-    return {
-      status: "unknown",
-      reason: "TikTok publish check structure is missing or ambiguous.",
-      evidence: info,
-    };
+    });
   }
 
-  const musicState = classifyTikTokCheckState(
-    info.musicStatusText,
-    TIKTOK_PUBLISH_READINESS.music
-  );
-  const contentState = classifyTikTokCheckState(
-    info.contentStatusText,
-    TIKTOK_PUBLISH_READINESS.content
-  );
+  const musicAnchorCount = info.musicAnchorCount;
+  const contentAnchorCount = info.contentAnchorCount;
+  if (
+    !Number.isInteger(musicAnchorCount) ||
+    !Number.isInteger(contentAnchorCount) ||
+    musicAnchorCount < 0 ||
+    contentAnchorCount < 0
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-check-anchor-counts",
+      reason: "TikTok publish check anchor counts are invalid.",
+      evidence: info,
+    });
+  }
+  if (musicAnchorCount > 1 || contentAnchorCount > 1) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "duplicate-check-anchors",
+      reason: "TikTok publish check structure contains duplicate anchors.",
+      evidence: info,
+    });
+  }
+  if (
+    (musicAnchorCount === 1 &&
+      typeof info.musicStatusText !== "string") ||
+    (contentAnchorCount === 1 &&
+      typeof info.contentStatusText !== "string")
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-check-status-observation",
+      reason: "TikTok publish check status observation is incomplete.",
+      evidence: info,
+    });
+  }
+
+  const musicState =
+    musicAnchorCount === 0
+      ? "missing"
+      : classifyTikTokCheckState(
+          info.musicStatusText,
+          TIKTOK_PUBLISH_READINESS.music
+        );
+  const contentState =
+    contentAnchorCount === 0
+      ? "missing"
+      : classifyTikTokCheckState(
+          info.contentStatusText,
+          TIKTOK_PUBLISH_READINESS.content
+        );
   const evidence = {
     ...info,
     musicState,
@@ -274,30 +361,70 @@ function classifyTikTokPublishReadinessInfo(info) {
   };
 
   if (musicState === "failed" || contentState === "failed") {
-    return {
+    return createTikTokReadinessClassification({
       status: "failed",
+      phase: "failed",
+      reasonCode: "check-failed",
       reason: "TikTok reported a failed publish check.",
       evidence,
-    };
+    });
   }
   if (musicState === "warning" || contentState === "warning") {
-    return {
+    return createTikTokReadinessClassification({
       status: "warning",
+      phase: "warning",
+      reasonCode: "check-warning",
       reason: "TikTok reported a publish check warning.",
       evidence,
-    };
+    });
   }
   if (musicState === "unknown" || contentState === "unknown") {
-    return {
+    return createTikTokReadinessClassification({
       status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "unknown-check-status",
       reason: "TikTok publish check state is unknown.",
       evidence,
-    };
+    });
+  }
+
+  const hasExactAnchorStructure =
+    musicAnchorCount === 1 && contentAnchorCount === 1;
+  if (!hasExactAnchorStructure) {
+    evidence.uploadState = info.uploadPendingVisible ? "pending" : "unknown";
+    return createTikTokReadinessClassification({
+      status: "pending",
+      phase: "hydrating-check-structure",
+      reasonCode: "check-structure-not-materialized",
+      reason: "TikTok publish check structure is still hydrating.",
+      evidence,
+    });
+  }
+  if (info.sameCheckRegion !== true) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "check-region-mismatch",
+      reason: "TikTok publish check anchors are not in one exact region.",
+      evidence,
+    });
+  }
+  if (musicState === "hydrating" || contentState === "hydrating") {
+    evidence.uploadState = info.uploadPendingVisible ? "pending" : "complete";
+    return createTikTokReadinessClassification({
+      status: "pending",
+      phase: "hydrating-check-status",
+      reasonCode: "check-status-not-materialized",
+      reason: "TikTok publish check status text is still hydrating.",
+      evidence,
+    });
   }
 
   const uploadState = info.uploadPendingVisible
     ? "pending"
-    : musicState === "safe" || musicState === "pending"
+    : [musicState, contentState].every((state) =>
+          ["safe", "pending"].includes(state)
+        )
       ? "complete"
       : "unknown";
   evidence.uploadState = uploadState;
@@ -307,29 +434,35 @@ function classifyTikTokPublishReadinessInfo(info) {
     musicState === "pending" ||
     contentState === "pending"
   ) {
-    return {
+    return createTikTokReadinessClassification({
       status: "pending",
+      phase: "waiting-for-checks",
+      reasonCode: "checks-pending",
       reason: "TikTok upload or publish checks are still pending.",
       evidence,
-    };
+    });
   }
   if (
     uploadState === "complete" &&
     musicState === "safe" &&
     contentState === "safe"
   ) {
-    return {
+    return createTikTokReadinessClassification({
       status: "ready",
+      phase: "ready",
+      reasonCode: "checks-safe",
       reason: "TikTok upload and publish checks reached exact safe states.",
       evidence,
-    };
+    });
   }
 
-  return {
+  return createTikTokReadinessClassification({
     status: "unknown",
+    phase: "unknown-terminal",
+    reasonCode: "readiness-unproven",
     reason: "TikTok publish readiness could not be proven.",
     evidence,
-  };
+  });
 }
 
 async function collectTikTokPublishReadinessInfo(page) {
@@ -417,109 +550,225 @@ async function waitForTikTokPublishReadiness(
     1,
     Number(requiredStablePolls) || 1
   );
+  const startedAt = Date.now();
   const deadline = Date.now() + safeMaxWaitMs;
   let lastLoggedState = "";
   let stableSignature = "";
   let stablePolls = 0;
+  let stableTargetHandle = null;
+  let polls = 0;
+  let lastQualifiedTargetCount = null;
+  let lastPhysicalTargetCount = null;
 
-  while (true) {
-    const info = await collectTikTokPublishReadinessInfo(page).catch(() => null);
-    const readiness = classifyTikTokPublishReadinessInfo(info);
-    const logState = JSON.stringify({
-      content: readiness.evidence?.contentState || "unknown",
-      music: readiness.evidence?.musicState || "unknown",
-      status: readiness.status,
-      upload: readiness.evidence?.uploadState || "unknown",
-    });
-    if (logState !== lastLoggedState) {
-      console.log(`TikTok publish readiness: ${logState}`);
-      lastLoggedState = logState;
+  const runtimeEvidence = (readiness, extra = {}) => ({
+    ...(readiness.evidence || {}),
+    phase: readiness.phase,
+    reasonCode: readiness.reasonCode,
+    elapsedMs: Math.max(0, Date.now() - startedAt),
+    polls,
+    ...(lastQualifiedTargetCount === null
+      ? {}
+      : { qualifiedTargetCount: lastQualifiedTargetCount }),
+    ...(lastPhysicalTargetCount === null
+      ? {}
+      : { physicalTargetCount: lastPhysicalTargetCount }),
+    ...extra,
+  });
+  const resetStableReadiness = async () => {
+    stablePolls = 0;
+    stableSignature = "";
+    if (stableTargetHandle) {
+      await stableTargetHandle.dispose().catch(() => {});
+      stableTargetHandle = null;
     }
+  };
 
-    if (readiness.status === "ready") {
-      const diagnostics = await collectPublishCandidateDiagnostics(page).catch(
+  try {
+    while (true) {
+      polls += 1;
+      const info = await collectTikTokPublishReadinessInfo(page).catch(
         () => null
       );
-      if (!diagnostics) {
+      const readiness = classifyTikTokPublishReadinessInfo(info);
+      const significantState = {
+        phase: readiness.phase,
+        status: readiness.status,
+        reasonCode: readiness.reasonCode,
+        musicAnchorCount: readiness.evidence?.musicAnchorCount ?? null,
+        contentAnchorCount: readiness.evidence?.contentAnchorCount ?? null,
+        musicState: readiness.evidence?.musicState || "unknown",
+        contentState: readiness.evidence?.contentState || "unknown",
+        uploadState: readiness.evidence?.uploadState || "unknown",
+        visibleDialogCount:
+          readiness.evidence?.visibleDialogCount ?? null,
+      };
+      const logState = JSON.stringify(significantState);
+      if (logState !== lastLoggedState) {
+        console.log(
+          `TikTok publish readiness: ${JSON.stringify({
+            ...significantState,
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+          })}`
+        );
+        lastLoggedState = logState;
+      }
+
+      if (readiness.status === "ready") {
+        const diagnostics = await collectPublishCandidateDiagnostics(
+          page
+        ).catch(() => null);
+        if (!diagnostics) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason: "TikTok publish target readiness could not be inspected.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "publish-target-diagnostics-unavailable",
+            }),
+          };
+        }
+        lastQualifiedTargetCount = diagnostics.qualifiedTargetCount;
+        lastPhysicalTargetCount = await page
+          .locator('[data-e2e="post_video_button"]')
+          .count()
+          .catch(() => null);
+        if (lastPhysicalTargetCount === null) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason: "TikTok publish target readiness could not be inspected.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "publish-target-diagnostics-unavailable",
+              diagnostics,
+            }),
+          };
+        }
+        if (
+          lastPhysicalTargetCount > 1 ||
+          diagnostics.qualifiedTargetCount > 1
+        ) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason:
+              "TikTok publish readiness found multiple physical publish targets.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "multiple-physical-publish-targets",
+              diagnostics,
+            }),
+          };
+        }
+        if (diagnostics.qualifiedTargetCount === 1) {
+          const target = diagnostics.candidates.find(
+            ({ status }) => status === "ACCEPTED"
+          );
+          if (
+            lastPhysicalTargetCount !== 1 ||
+            target?.dataE2e !== "post_video_button"
+          ) {
+            await resetStableReadiness();
+          } else {
+            const currentTargetHandle = await getCanonicalPublishOwner(
+              page.locator('[data-e2e="post_video_button"]').first()
+            );
+            if (!currentTargetHandle) {
+              return {
+                ok: false,
+                outcome: "failure",
+                retryAllowed: true,
+                clickAttempted: false,
+                reason:
+                  "TikTok publish target readiness could not be inspected.",
+                evidence: runtimeEvidence(readiness, {
+                  phase: "unknown-terminal",
+                  reasonCode: "publish-target-owner-unavailable",
+                  diagnostics,
+                }),
+              };
+            }
+            const samePhysicalTarget = stableTargetHandle
+              ? await currentTargetHandle
+                  .evaluate(
+                    (element, previous) => element === previous,
+                    stableTargetHandle
+                  )
+                  .catch(() => false)
+              : false;
+            const signature = JSON.stringify({
+              contentStatusText: readiness.evidence.contentStatusText,
+              dataE2e: target.dataE2e,
+              label: normalizeUiText(target.text || target.ariaLabel),
+              musicStatusText: readiness.evidence.musicStatusText,
+              pageOrigin: target.pageOrigin || "",
+              pagePath: target.pagePath || "",
+              structuralBinding: target.structuralBinding || "",
+            });
+            stablePolls =
+              samePhysicalTarget && signature === stableSignature
+                ? stablePolls + 1
+                : 1;
+            stableSignature = signature;
+            if (stableTargetHandle) {
+              await stableTargetHandle.dispose().catch(() => {});
+            }
+            stableTargetHandle = currentTargetHandle;
+            if (stablePolls >= safeRequiredStablePolls) {
+              return {
+                ok: true,
+                outcome: "ready",
+                retryAllowed: true,
+                clickAttempted: false,
+                reason: readiness.reason,
+                evidence: runtimeEvidence(readiness, {
+                  phase: "ready",
+                  reasonCode: "checks-safe-and-stable",
+                  stablePolls,
+                }),
+              };
+            }
+          }
+        } else {
+          await resetStableReadiness();
+        }
+      } else if (readiness.status !== "pending") {
         return {
           ok: false,
           outcome: "failure",
           retryAllowed: true,
           clickAttempted: false,
-          reason: "TikTok publish target readiness could not be inspected.",
-          evidence: readiness.evidence,
+          reason: readiness.reason,
+          evidence: runtimeEvidence(readiness),
         };
+      } else {
+        await resetStableReadiness();
       }
-      if (diagnostics.qualifiedTargetCount > 1) {
+
+      if (Date.now() >= deadline) {
         return {
           ok: false,
           outcome: "failure",
           retryAllowed: true,
           clickAttempted: false,
           reason:
-            "TikTok publish readiness found multiple physical publish targets.",
-          evidence: { readiness: readiness.evidence, diagnostics },
+            "TikTok upload or publish checks remained pending until the bounded readiness timeout.",
+          evidence: runtimeEvidence(readiness, { stablePolls }),
         };
       }
-      if (diagnostics.qualifiedTargetCount === 1) {
-        const target = diagnostics.candidates.find(
-          ({ status }) => status === "ACCEPTED"
-        );
-        const signature = JSON.stringify({
-          contentStatusText: readiness.evidence.contentStatusText,
-          dataE2e: target?.dataE2e || "",
-          label: normalizeUiText(target?.text || target?.ariaLabel),
-          musicStatusText: readiness.evidence.musicStatusText,
-          pageOrigin: target?.pageOrigin || "",
-          pagePath: target?.pagePath || "",
-          structuralBinding: target?.structuralBinding || "",
-        });
-        stablePolls = signature === stableSignature ? stablePolls + 1 : 1;
-        stableSignature = signature;
-        if (stablePolls >= safeRequiredStablePolls) {
-          return {
-            ok: true,
-            outcome: "ready",
-            retryAllowed: true,
-            clickAttempted: false,
-            reason: readiness.reason,
-            evidence: {
-              ...readiness.evidence,
-              qualifiedTargetCount: diagnostics.qualifiedTargetCount,
-              stablePolls,
-            },
-          };
-        }
-      } else {
-        stablePolls = 0;
-        stableSignature = "";
-      }
-    } else if (readiness.status !== "pending") {
-      return {
-        ok: false,
-        outcome: "failure",
-        retryAllowed: true,
-        clickAttempted: false,
-        reason: readiness.reason,
-        evidence: readiness.evidence,
-      };
-    } else {
-      stablePolls = 0;
-      stableSignature = "";
+      await page.waitForTimeout(safePollIntervalMs);
     }
-
-    if (Date.now() >= deadline) {
-      return {
-        ok: false,
-        outcome: "failure",
-        retryAllowed: true,
-        clickAttempted: false,
-        reason:
-          "TikTok upload or publish checks remained pending until the bounded readiness timeout.",
-        evidence: readiness.evidence,
-      };
+  } finally {
+    if (stableTargetHandle) {
+      await stableTargetHandle.dispose().catch(() => {});
     }
-    await page.waitForTimeout(safePollIntervalMs);
   }
 }
 
@@ -3071,6 +3320,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       error.retryAllowed = confirmation.retryAllowed;
       error.reason = confirmation.reason;
       error.evidence = confirmation.evidence;
+      error.diagnostics = confirmation.diagnostics;
       error.clickAttempted = confirmation.clickAttempted;
       throw error;
     }
@@ -3099,19 +3349,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
     );
     await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => { });
     closeHoldMs = Math.max(config.failureHoldMs, 0);
-    return {
-      ok: false,
-      outcome: error.outcome || "failure",
-      retryAllowed:
-        typeof error.retryAllowed === "boolean"
-          ? error.retryAllowed
-          : true,
-      error: error.message,
-      reason: error.reason || error.message,
-      evidence: error.evidence,
-      clickAttempted: getPublishClickAttempted(error),
-      screenshotPath,
-    };
+    return buildTikTokUploadFailureResult(error, screenshotPath);
   } finally {
     if (publishResponseTracker) {
       publishResponseTracker.dispose();
@@ -3131,6 +3369,7 @@ module.exports = {
     classifyPublishCandidateInfo,
     classifyTikTokPublishPreparationInfo,
     classifyTikTokPublishReadinessInfo,
+    buildTikTokUploadFailureResult,
     clickPublishOnce,
     collectTikTokPublishTargetResolutionDiagnostics,
     collectTikTokPublishReadinessInfo,

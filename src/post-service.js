@@ -141,6 +141,7 @@ async function postSingleVideo({
     retryAllowed: result.retryAllowed,
     reason: result.reason,
     evidence: result.evidence,
+    diagnostics: result.diagnostics,
     clickAttempted: result.clickAttempted,
     screenshotPath: result.screenshotPath,
   };

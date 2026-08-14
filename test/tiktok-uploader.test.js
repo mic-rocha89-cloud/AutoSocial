@@ -5,6 +5,7 @@ const { chromium } = require("playwright");
 const { uploadVideo, _private } = require("../src/tiktok-uploader");
 
 const {
+  buildTikTokUploadFailureResult,
   classifyPublishCandidateInfo,
   classifyTikTokPublishReadinessInfo,
   clickPublishOnce,
@@ -31,6 +32,31 @@ test("TikTok pre-publish errors explicitly serialize publish clickAttempted fals
   assert.equal(getPublishClickAttempted(new Error("pre-publish failure")), false);
   assert.equal(getPublishClickAttempted({ clickAttempted: false }), false);
   assert.equal(getPublishClickAttempted({ clickAttempted: true }), true);
+});
+
+test("TikTok upload failure serialization preserves resolution diagnostics", () => {
+  const diagnostics = {
+    schemaVersion: 1,
+    directPostCount: 1,
+    finalTargetCount: 0,
+  };
+  const error = new Error("Publish verification failed: target unavailable");
+  error.outcome = "failure";
+  error.retryAllowed = true;
+  error.reason = "target unavailable";
+  error.diagnostics = diagnostics;
+  error.clickAttempted = false;
+
+  const result = buildTikTokUploadFailureResult(
+    error,
+    "last-upload-error.png"
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, "failure");
+  assert.equal(result.retryAllowed, true);
+  assert.equal(result.clickAttempted, false);
+  assert.equal(result.reason, "target unavailable");
+  assert.deepEqual(result.diagnostics, diagnostics);
 });
 
 test("TikTok publish candidate rejects the Studio sidebar Posts item", () => {
@@ -2013,7 +2039,7 @@ test("TikTok post-scroll target resolution diagnostics are exact and read only",
   await t.test("none status keeps semantics and clickAttempted false", async () => {
     const page = await createHydratedStudioPublishPage(browser);
     try {
-      const { resolution, click } = await withPostVisibilityOverride(
+      const { resolution, click, publish } = await withPostVisibilityOverride(
         page,
         false,
         async () => ({
@@ -2030,6 +2056,13 @@ test("TikTok post-scroll target resolution diagnostics are exact and read only",
               settleMs: 0,
             })
           ),
+          publish: await captureResolutionLogs(() =>
+            publishFailClosed(
+              page,
+              createResponseTracker(),
+              fastPublishOptions()
+            )
+          ),
         })
       );
       const expectedReason =
@@ -2043,6 +2076,12 @@ test("TikTok post-scroll target resolution diagnostics are exact and read only",
       assert.equal(click.result.reason, expectedReason);
       assert.equal(click.result.diagnostics.directPostCount, 1);
       assert.equal(click.result.diagnostics.finalTargetCount, 0);
+      assert.equal(publish.result.outcome, "failure");
+      assert.equal(publish.result.retryAllowed, true);
+      assert.equal(publish.result.clickAttempted, false);
+      assert.equal(publish.result.reason, expectedReason);
+      assert.equal(publish.result.diagnostics.directPostCount, 1);
+      assert.equal(publish.result.diagnostics.finalTargetCount, 0);
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
       assert.equal(
         resolution.logs.filter((entry) => entry.startsWith(diagnosticPrefix))
@@ -2051,6 +2090,11 @@ test("TikTok post-scroll target resolution diagnostics are exact and read only",
       );
       assert.equal(
         click.logs.filter((entry) => entry.startsWith(diagnosticPrefix)).length,
+        1
+      );
+      assert.equal(
+        publish.logs.filter((entry) => entry.startsWith(diagnosticPrefix))
+          .length,
         1
       );
       assert.doesNotThrow(() =>
@@ -2119,6 +2163,288 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
   t.after(() => browser.close());
   const contentPending =
     "Checking in progress. This will take about 10 minutes. Longer videos may take more time.";
+
+  await t.test("bounded hydration advances from zero anchors to two stable safe polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus:
+        "Checking in progress. This will take about 30 seconds.",
+      contentCheckStatus: contentPending,
+    });
+    const originalWaitForTimeout = page.waitForTimeout;
+    const originalConsoleLog = console.log;
+    const readinessLogs = [];
+    let waits = 0;
+    console.log = (...args) => readinessLogs.push(args.map(String).join(" "));
+    try {
+      await page.evaluate(() => {
+        document.querySelector('[data-e2e="copyright_container"]').remove();
+        document.querySelector(".headline-wrapper").remove();
+      });
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page.evaluate(() => {
+            const anchor = document.createElement("div");
+            anchor.setAttribute("data-e2e", "copyright_container");
+            anchor.textContent = "Music copyright check";
+            document.querySelector(".copyright-check").prepend(anchor);
+          });
+        } else if (waits === 2) {
+          await page.evaluate(() => {
+            const anchor = document.createElement("div");
+            anchor.className = "headline-wrapper";
+            anchor.textContent = "Content check lite";
+            document.querySelector(".content-check").prepend(anchor);
+          });
+        } else if (waits === 3) {
+          await page.evaluate(
+            ({ contentSafe, musicSafe }) => {
+              document.querySelector(
+                ".copyright-check .check-status"
+              ).textContent = musicSafe;
+              document.querySelector(
+                ".content-check .check-status"
+              ).textContent = contentSafe;
+            },
+            {
+              contentSafe: SAFE_CONTENT_CHECK_STATUS,
+              musicSafe: SAFE_MUSIC_CHECK_STATUS,
+            }
+          );
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.outcome, "ready");
+      assert.equal(result.evidence.phase, "ready");
+      assert.equal(result.evidence.reasonCode, "checks-safe-and-stable");
+      assert.equal(result.evidence.polls, 5);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(
+        readinessLogs.filter((entry) =>
+          entry.startsWith("TikTok publish readiness: ")
+        ).length,
+        4
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      console.log = originalConsoleLog;
+      await page.close();
+    }
+  });
+
+  await t.test("zero anchors remain transient only until the bounded timeout", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        document.querySelector('[data-e2e="copyright_container"]').remove();
+        document.querySelector(".headline-wrapper").remove();
+      });
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+      assert.equal(initial.phase, "hydrating-check-structure");
+      assert.equal(initial.reasonCode, "check-structure-not-materialized");
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(result.evidence.phase, "hydrating-check-structure");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("content-only partial structure is transient and never ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="copyright_container"]')
+        .evaluate((anchor) => anchor.remove());
+      const readiness = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(readiness.status, "pending");
+      assert.equal(readiness.phase, "hydrating-check-structure");
+      assert.equal(readiness.evidence.musicState, "missing");
+      assert.equal(readiness.evidence.contentState, "safe");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const partialScenario of [
+    {
+      name: "partial structure with warning text",
+      musicStatus: "Copyright issue found.",
+      status: "warning",
+      reasonCode: "check-warning",
+    },
+    {
+      name: "partial structure with unknown non-empty text",
+      musicStatus: "Analysis queued for later review.",
+      status: "unknown",
+      reasonCode: "unknown-check-status",
+    },
+  ]) {
+    await t.test(`${partialScenario.name} remains terminal`, async () => {
+      const page = await createHydratedStudioPublishPage(browser, {
+        musicCheckStatus: partialScenario.musicStatus,
+      });
+      try {
+        await page
+          .locator(".headline-wrapper")
+          .evaluate((anchor) => anchor.remove());
+        const readiness = classifyTikTokPublishReadinessInfo(
+          await collectTikTokPublishReadinessInfo(page)
+        );
+        assert.equal(readiness.status, partialScenario.status);
+        assert.equal(readiness.reasonCode, partialScenario.reasonCode);
+        assert.notEqual(readiness.phase, "hydrating-check-structure");
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("exact anchors in different regions are terminal ambiguity", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.locator(".content-check").evaluate((section) => {
+        section.parentElement.parentElement.appendChild(section);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(result.evidence.phase, "unknown-terminal");
+      assert.equal(result.evidence.reasonCode, "check-region-mismatch");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const anchorScenario of [
+    {
+      name: "duplicate music anchors",
+      selector: '[data-e2e="copyright_container"]',
+    },
+    {
+      name: "duplicate content anchors",
+      selector: ".headline-wrapper",
+    },
+  ]) {
+    await t.test(`${anchorScenario.name} fail immediately`, async () => {
+      const page = await createHydratedStudioPublishPage(browser);
+      try {
+        await page.locator(anchorScenario.selector).evaluate((anchor) => {
+          anchor.parentElement.prepend(anchor.cloneNode(true));
+        });
+        const result = await waitForTikTokPublishReadiness(page, {
+          maxWaitMs: 1000,
+          pollIntervalMs: 100,
+        });
+        assert.equal(result.ok, false);
+        assert.equal(result.clickAttempted, false);
+        assert.equal(result.evidence.phase, "unknown-terminal");
+        assert.equal(result.evidence.reasonCode, "duplicate-check-anchors");
+        assert.equal(result.evidence.polls, 1);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("wrong Studio path fails immediately", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      pathName: "/tiktokstudio/content",
+    });
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(result.evidence.phase, "unknown-terminal");
+      assert.equal(result.evidence.reasonCode, "studio-upload-page-mismatch");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("malformed structural observations remain terminal", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const validInfo = await collectTikTokPublishReadinessInfo(page);
+      for (const malformedInfo of [
+        { ...validInfo, musicAnchorCount: null },
+        { ...validInfo, contentAnchorCount: "1" },
+        { ...validInfo, uploadPendingVisible: null },
+      ]) {
+        const readiness = classifyTikTokPublishReadinessInfo(malformedInfo);
+        assert.equal(readiness.status, "unknown");
+        assert.equal(readiness.phase, "unknown-terminal");
+        assert.match(readiness.reasonCode, /^invalid-/);
+      }
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("exact structure with empty statuses hydrates but never becomes ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: "",
+      contentCheckStatus: "",
+    });
+    try {
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+      assert.equal(initial.phase, "hydrating-check-status");
+      assert.equal(initial.reasonCode, "check-status-not-materialized");
+      assert.equal(initial.evidence.musicState, "hydrating");
+      assert.equal(initial.evidence.contentState, "hydrating");
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(result.evidence.phase, "hydrating-check-status");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
 
   await t.test("real pending state becomes eligible only after exact safe state", async () => {
     const page = await createHydratedStudioPublishPage(browser, {
@@ -2194,16 +2520,19 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
       name: "copyright warning",
       musicCheckStatus: "Copyright issue found.",
       expected: "warning",
+      reasonCode: "check-warning",
     },
     {
       name: "copyright check failure",
       musicCheckStatus: "Unable to complete the copyright check.",
       expected: "failed",
+      reasonCode: "check-failed",
     },
     {
       name: "unknown content check state",
       contentCheckStatus: "Analysis queued for later review.",
       expected: "unknown",
+      reasonCode: "unknown-check-status",
     },
   ]) {
     await t.test(`${scenario.name} fails closed`, async () => {
@@ -2213,6 +2542,8 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
           await collectTikTokPublishReadinessInfo(page)
         );
         assert.equal(readiness.status, scenario.expected);
+        assert.equal(readiness.reasonCode, scenario.reasonCode);
+        assert.notEqual(readiness.phase, "hydrating-check-status");
         const result = await publishFailClosed(
           page,
           createResponseTracker(),
@@ -2277,6 +2608,8 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
       assert.equal(result.ok, false);
       assert.equal(result.clickAttempted, false);
       assert.match(result.reason, /visible dialog/i);
+      assert.equal(result.evidence.phase, "blocked");
+      assert.equal(result.evidence.reasonCode, "visible-dialog");
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
     } finally {
       await page.close();
@@ -2318,6 +2651,146 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
       );
       assert.equal(await page.evaluate(() => window.publishClickCount), 1);
     } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two stable polls are required even when the first poll is ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 2);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("signature changes reset stable readiness polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalWaitForTimeout = page.waitForTimeout;
+    let waits = 0;
+    try {
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page
+            .locator('[data-e2e="post_video_button"]')
+            .evaluate((target) => {
+              target.textContent = "Publish";
+            });
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 3);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      await page.close();
+    }
+  });
+
+  await t.test("physical target replacement resets stable readiness polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalWaitForTimeout = page.waitForTimeout;
+    let waits = 0;
+    try {
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page
+            .locator('[data-e2e="post_video_button"]')
+            .evaluate((target) => {
+              const replacement = target.cloneNode(true);
+              replacement.id = "stable-readiness-replacement";
+              target.replaceWith(replacement);
+            });
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 3);
+      assert.equal(
+        await page.locator("#stable-readiness-replacement").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      await page.close();
+    }
+  });
+
+  await t.test("multiple physical publish targets fail readiness immediately", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "readiness-duplicate-action-group";
+        original.parentElement.appendChild(duplicate);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(
+        result.evidence.reasonCode,
+        "multiple-physical-publish-targets"
+      );
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("unavailable target diagnostics fail closed", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalGetByRole = page.getByRole;
+    try {
+      page.getByRole = function (...args) {
+        const locator = originalGetByRole.apply(page, args);
+        locator.count = async () => {
+          throw new Error("fixture diagnostics unavailable");
+        };
+        return locator;
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(
+        result.evidence.reasonCode,
+        "publish-target-diagnostics-unavailable"
+      );
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.getByRole = originalGetByRole;
       await page.close();
     }
   });

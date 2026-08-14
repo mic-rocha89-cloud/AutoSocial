@@ -61,6 +61,11 @@ test("a new scheduler controller cannot select an uncertain item after restart",
           retryAllowed: false,
           reason: "confirmation timed out",
           error: "confirmation timed out",
+          diagnostics: {
+            schemaVersion: 1,
+            directPostCount: 1,
+            finalTargetCount: 0,
+          },
         };
       },
     },
@@ -82,6 +87,12 @@ test("a new scheduler controller cannot select an uncertain item after restart",
     const firstResult = await firstController.runOnce("scheduler");
     assert.equal(firstResult.outcome, "uncertain");
     assert.equal(firstResult.retryAllowed, false);
+    const firstStatus = await firstController.getStatus();
+    assert.deepEqual(firstStatus.lastResult.diagnostics, {
+      schemaVersion: 1,
+      directPostCount: 1,
+      finalTargetCount: 0,
+    });
 
     const restartedController = new TestDaemonController(controllerOptions);
     const secondResult = await restartedController.runOnce("dashboard");
