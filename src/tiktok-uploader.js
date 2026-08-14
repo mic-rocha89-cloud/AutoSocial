@@ -2580,13 +2580,6 @@ async function clickPublishOnce(
       await beforeClick();
     }
 
-    if (
-      publishResponseTracker &&
-      typeof publishResponseTracker.beginClick === "function"
-    ) {
-      publishResponseTracker.beginClick(operationId);
-    }
-
     const finalTargets = await collectUniquePublishTargets(page);
     if (finalTargets.length !== 1) {
       const count = finalTargets.length;
@@ -2662,6 +2655,19 @@ async function clickPublishOnce(
 
     try {
       actionGuard.consume();
+      if (
+        publishResponseTracker &&
+        typeof publishResponseTracker.beginClick === "function"
+      ) {
+        publishResponseTracker.beginClick(operationId, {
+          activeComposerMatched:
+            finalBoundaryInfo.documentPopulatedFileInputCount === 1 &&
+            [
+              "active-upload-form",
+              "verified-upload-action-region",
+            ].includes(finalBoundaryInfo.structuralBinding),
+        });
+      }
       await finalTarget.handle.click({ timeout: 5000 });
     } catch (error) {
       return {
@@ -2780,14 +2786,109 @@ function isLikelyPublishApiResponse(response, expectedOrigin) {
   );
 }
 
+function getSafeHttpEvidenceUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "unavailable";
+  }
+}
+
+function normalizePublishedPostId(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return /^\d{8,32}$/.test(normalized) ? normalized : null;
+}
+
+function extractPublishedPostId(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  for (const [key, validValue] of [
+    ["code", new Set([0, "0"])],
+    ["status_code", new Set([0, "0"])],
+    ["statusCode", new Set([0, "0"])],
+    ["success", new Set([true])],
+  ]) {
+    if (
+      Object.prototype.hasOwnProperty.call(payload, key) &&
+      !validValue.has(payload[key])
+    ) {
+      return null;
+    }
+  }
+
+  const postIdKeys = new Set([
+    "post_id",
+    "postId",
+    "item_id",
+    "itemId",
+    "aweme_id",
+    "awemeId",
+  ]);
+  const postIds = new Set();
+  const seen = new WeakSet();
+  let visitedNodes = 0;
+  let exceededInspectionLimit = false;
+
+  const visit = (value, depth) => {
+    if (
+      exceededInspectionLimit ||
+      value === null ||
+      typeof value !== "object" ||
+      depth > 8
+    ) {
+      return;
+    }
+    if (seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    visitedNodes += 1;
+    if (visitedNodes > 1000) {
+      exceededInspectionLimit = true;
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (postIdKeys.has(key)) {
+        const postId = normalizePublishedPostId(entry);
+        if (postId) {
+          postIds.add(postId);
+        }
+      }
+      visit(entry, depth + 1);
+    }
+  };
+
+  visit(payload, 0);
+  if (exceededInspectionLimit || postIds.size !== 1) {
+    return null;
+  }
+  return [...postIds][0];
+}
+
 function createPublishResponseTracker(page) {
   let armed = false;
   let clickStarted = false;
   let operationId = null;
+  let activeComposerMatched = false;
   let expectedOrigin = null;
   let publishApiSuccess = null;
   let publishApiFailure = null;
   let startedRequests = new WeakSet();
+  let generation = 0;
 
   const requestHandler = (request) => {
     if (!armed || !clickStarted) {
@@ -2815,7 +2916,7 @@ function createPublishResponseTracker(page) {
     }
 
     const status = response.status();
-    const url = response.url();
+    const url = getSafeHttpEvidenceUrl(response.url());
     const method = response.request().method().toUpperCase();
     const evidence = {
       type: "http",
@@ -2826,12 +2927,48 @@ function createPublishResponseTracker(page) {
       expectedOriginMatched: true,
       requestStartedAfterClick: true,
       responseCompletedAfterClick: true,
-      currentVideoMatched: false,
+      activeComposerMatched,
+      currentVideoMatched: activeComposerMatched,
     };
 
     if (status >= 200 && status < 300) {
       publishApiSuccess = evidence;
-      console.log(`Publish API success: ${method} ${status} ${url}`);
+      console.log(
+        `Publish API response observed: ${method} ${status} ${url}; ` +
+          "awaiting operation binding."
+      );
+      const responseGeneration = generation;
+      const responseOperationId = operationId;
+      Promise.resolve()
+        .then(() =>
+          typeof response.json === "function" ? response.json() : null
+        )
+        .then((payload) => {
+          if (
+            !armed ||
+            generation !== responseGeneration ||
+            operationId !== responseOperationId
+          ) {
+            return;
+          }
+          const postId = extractPublishedPostId(payload);
+          if (!postId) {
+            return;
+          }
+          publishApiSuccess = {
+            ...evidence,
+            postId,
+            postIdSource: "response-body",
+          };
+          if (activeComposerMatched && responseOperationId) {
+            console.log(
+              `Publish API response bound to operation: ${method} ${status} ${url}`
+            );
+          }
+        })
+        .catch(() => {
+          // A 2xx response without a parseable, unique post ID remains unbound.
+        });
       return;
     }
 
@@ -2855,16 +2992,21 @@ function createPublishResponseTracker(page) {
       startedRequests = new WeakSet();
       clickStarted = false;
       operationId = null;
+      activeComposerMatched = false;
       armed = true;
+      generation += 1;
     },
-    beginClick(currentOperationId) {
+    beginClick(currentOperationId, { activeComposerMatched: matched } = {}) {
       if (!armed) {
         return;
       }
       operationId = currentOperationId || null;
+      activeComposerMatched = matched === true;
       clickStarted = true;
     },
     dispose() {
+      armed = false;
+      generation += 1;
       page.off("request", requestHandler);
       page.off("response", responseHandler);
     },
@@ -2881,14 +3023,19 @@ function isAuthoritativePublishEvidence(evidence) {
   return Boolean(
     evidence &&
       evidence.type === "http" &&
+      ["POST", "PUT", "PATCH"].includes(evidence.method) &&
+      Number.isInteger(evidence.status) &&
+      evidence.status >= 200 &&
+      evidence.status < 300 &&
       evidence.expectedOriginMatched === true &&
       evidence.requestStartedAfterClick === true &&
       evidence.responseCompletedAfterClick === true &&
+      evidence.activeComposerMatched === true &&
       evidence.currentVideoMatched === true &&
       typeof evidence.operationId === "string" &&
       evidence.operationId.length > 0 &&
-      typeof evidence.postId === "string" &&
-      evidence.postId.length > 0
+      evidence.postIdSource === "response-body" &&
+      normalizePublishedPostId(evidence.postId) === evidence.postId
   );
 }
 

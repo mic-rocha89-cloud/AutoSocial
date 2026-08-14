@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const { chromium } = require("playwright");
 
 const { uploadVideo, _private } = require("../src/tiktok-uploader");
@@ -19,6 +20,8 @@ const {
   findUniquePublishTarget,
   getPublishClickAttempted,
   getPublishCandidateScore,
+  createPublishResponseTracker,
+  isAuthoritativePublishEvidence,
   isLikelyPublishApiResponse,
   isLikelyPublishCandidateInfo,
   prepareTikTokPublishTargetForQualification,
@@ -833,7 +836,7 @@ test("TikTok safely dismisses only the exact known editor onboarding", async (t)
   });
 });
 
-test("TikTok final publish boundary has no setup call after owner validation", () => {
+test("TikTok final publish boundary binds the tracker synchronously before the only click", () => {
   const source = clickPublishOnce.toString();
   const beginClickIndex = source.indexOf("publishResponseTracker.beginClick");
   const finalCollectionIndex = source.indexOf(
@@ -850,18 +853,18 @@ test("TikTok final publish boundary has no setup call after owner validation", (
   const clickIndex = source.indexOf("await finalTarget.handle.click");
 
   assert.ok(beginClickIndex >= 0);
-  assert.ok(beginClickIndex < finalCollectionIndex);
   assert.ok(finalCollectionIndex < finalBoundaryIndex);
   assert.ok(finalBoundaryIndex < finalBoundaryEndIndex);
   assert.ok(finalBoundaryEndIndex < consumeIndex);
-  assert.ok(consumeIndex < clickIndex);
+  assert.ok(consumeIndex < beginClickIndex);
+  assert.ok(beginClickIndex < clickIndex);
   assert.doesNotMatch(
     source.slice(finalBoundaryEndIndex, consumeIndex),
     /\bawait\b|waitFor|scroll|locator\(|beginClick|beforeClick|beforeFinalValidation/
   );
-  assert.match(
+  assert.doesNotMatch(
     source.slice(consumeIndex, clickIndex),
-    /^actionGuard\.consume\(\);\s*$/
+    /\bawait\b|waitFor|scroll|locator\(/
   );
 });
 
@@ -902,6 +905,129 @@ function createResponseTracker({ success = false, failure = null } = {}) {
     dispose() {},
   };
 }
+
+function createPublishResponseHarness({
+  payload = {
+    code: 0,
+    data: { post_id: "7420000000000000001" },
+  },
+  requestUrl =
+    "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=secret",
+} = {}) {
+  const page = new EventEmitter();
+  page.url = () => "https://www.tiktok.com/tiktokstudio/upload";
+  const request = {
+    method: () => "POST",
+    postData: () => JSON.stringify({ project_id: "current-project" }),
+    url: () => requestUrl,
+  };
+  const response = {
+    json: async () => payload,
+    request: () => request,
+    status: () => 200,
+    url: () => requestUrl,
+  };
+  return { page, request, response };
+}
+
+test("TikTok publish response becomes authoritative only for the bound operation", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm();
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), true);
+    assert.equal(evidence.currentVideoMatched, true);
+    assert.equal(evidence.operationId, "operation-fixture");
+    assert.equal(evidence.postId, "7420000000000000001");
+    assert.equal(
+      evidence.url,
+      "https://www.tiktok.com/tiktok/web/project/post/v1/"
+    );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without the active composer proof", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm();
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: false,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(evidence.currentVideoMatched, false);
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without one valid returned post ID", async () => {
+  for (const payload of [
+    { code: 0, data: { project_id: "current-project" } },
+    { code: 1001, data: { post_id: "7420000000000000001" } },
+    { code: 0, data: { post_id: "not-a-post-id" } },
+    {
+      code: 0,
+      data: {
+        post_id: "7420000000000000001",
+        item_id: "7420000000000000002",
+      },
+    },
+  ]) {
+    const { page, request, response } = createPublishResponseHarness({
+      payload,
+    });
+    const tracker = createPublishResponseTracker(page);
+    try {
+      tracker.arm();
+      tracker.beginClick("operation-fixture", {
+        activeComposerMatched: true,
+      });
+      page.emit("request", request);
+      page.emit("response", response);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        isAuthoritativePublishEvidence(tracker.success()),
+        false,
+        JSON.stringify(payload)
+      );
+    } finally {
+      tracker.dispose();
+    }
+  }
+});
+
+test("TikTok publish request observed before the click boundary is ignored", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(tracker.success(), null);
+  } finally {
+    tracker.dispose();
+  }
+});
 
 const SAFE_MUSIC_CHECK_STATUS = "No issues found.";
 const SAFE_CONTENT_CHECK_STATUS =
@@ -1670,7 +1796,7 @@ test("TikTok final action preparation remains exact and fail closed", async (t) 
     );
     assert.match(
       source,
-      /actionGuard\.consume\(\);\s*await finalTarget\.handle\.click/
+      /actionGuard\.consume\(\);[\s\S]*publishResponseTracker\.beginClick[\s\S]*await finalTarget\.handle\.click/
     );
   });
 });
@@ -3048,15 +3174,19 @@ test("TikTok never bypasses the incomplete-check transaction dialog", async (t) 
         arm() {
           evidence = null;
         },
-        beginClick(operationId) {
+        beginClick(operationId, binding) {
           evidence = {
             type: "http",
+            method: "POST",
+            status: 200,
             expectedOriginMatched: true,
             requestStartedAfterClick: true,
             responseCompletedAfterClick: true,
-            currentVideoMatched: true,
+            activeComposerMatched: binding.activeComposerMatched,
+            currentVideoMatched: binding.activeComposerMatched,
             operationId,
-            postId: "fixture-post-id",
+            postId: "7420000000000000001",
+            postIdSource: "response-body",
           };
         },
         success() {
@@ -3265,6 +3395,95 @@ test("TikTok publish target requires exact identity and active composer binding"
 test("TikTok final publish is fail-closed across confirmation paths", async (t) => {
   const browser = await chromium.launch({ headless: true });
   t.after(() => browser.close());
+
+  await t.test("bound mocked publish response confirms the one-click operation", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/?session_token=fixture', {method:'POST'});",
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: { post_id: "7420000000000000001" },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 10,
+          confirmationPollIntervalMs: 10,
+        })
+      );
+      assert.equal(result.outcome, "success", JSON.stringify(result));
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, true);
+      assert.equal(result.evidence.postId, "7420000000000000001");
+      assert.equal(
+        result.evidence.url,
+        "https://www.tiktok.com/tiktok/web/project/post/v1/"
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two populated files keep a valid mocked response unbound", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST'});",
+    });
+    await page.locator("#upload-composer").evaluate((composer) => {
+      const secondInput = document.createElement("input");
+      secondInput.id = "second-upload-input";
+      secondInput.type = "file";
+      composer.appendChild(secondInput);
+    });
+    await page.locator("#second-upload-input").setInputFiles({
+      name: "second-fixture.mp4",
+      mimeType: "video/mp4",
+      buffer: Buffer.from("second local fixture"),
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: { post_id: "7420000000000000001" },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 3,
+          confirmationPollIntervalMs: 10,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
 
   await t.test("unbound DOM status remains uncertain after one click", async () => {
     const page = await createPublishPage(browser, {
