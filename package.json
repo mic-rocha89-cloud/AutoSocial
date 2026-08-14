@@ -9,6 +9,7 @@
     "clean:debug": "node scripts/clean-runtime.js",
     "check": "npm run check:syntax && npm test",
     "check:syntax": "node scripts/check-syntax.js",
+    "diagnose:tiktok:no-publish": "node scripts/diagnose-tiktok-no-publish.js",
     "doctor": "node scripts/doctor.js",
     "test": "node --test",
     "login": "node src/cli.js login",

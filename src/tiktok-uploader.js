@@ -542,6 +542,7 @@ async function waitForTikTokPublishReadiness(
     maxWaitMs = 12 * 60 * 1000,
     pollIntervalMs = 5000,
     requiredStablePolls = 2,
+    onTransition = null,
   } = {}
 ) {
   const safeMaxWaitMs = Math.max(0, Number(maxWaitMs) || 0);
@@ -604,12 +605,18 @@ async function waitForTikTokPublishReadiness(
       };
       const logState = JSON.stringify(significantState);
       if (logState !== lastLoggedState) {
+        const transition = Object.freeze({
+          ...significantState,
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          polls,
+          clickAttempted: false,
+        });
         console.log(
-          `TikTok publish readiness: ${JSON.stringify({
-            ...significantState,
-            elapsedMs: Math.max(0, Date.now() - startedAt),
-          })}`
+          `TikTok publish readiness: ${JSON.stringify(transition)}`
         );
+        if (typeof onTransition === "function") {
+          await onTransition(transition);
+        }
         lastLoggedState = logState;
       }
 

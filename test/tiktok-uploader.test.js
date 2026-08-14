@@ -2173,6 +2173,7 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
     const originalWaitForTimeout = page.waitForTimeout;
     const originalConsoleLog = console.log;
     const readinessLogs = [];
+    const transitions = [];
     let waits = 0;
     console.log = (...args) => readinessLogs.push(args.map(String).join(" "));
     try {
@@ -2219,6 +2220,7 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
         maxWaitMs: 1000,
         pollIntervalMs: 0,
         requiredStablePolls: 2,
+        onTransition: async (transition) => transitions.push(transition),
       });
       assert.equal(result.ok, true, JSON.stringify(result));
       assert.equal(result.outcome, "ready");
@@ -2231,6 +2233,30 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
           entry.startsWith("TikTok publish readiness: ")
         ).length,
         4
+      );
+      assert.deepEqual(
+        transitions.map(({ phase }) => phase),
+        [
+          "hydrating-check-structure",
+          "hydrating-check-structure",
+          "waiting-for-checks",
+          "ready",
+        ]
+      );
+      assert.deepEqual(
+        transitions.map(({ polls }) => polls),
+        [1, 2, 3, 4]
+      );
+      assert.equal(transitions.every((transition) => Object.isFrozen(transition)), true);
+      assert.equal(
+        transitions.every(
+          (transition) => !("page" in transition) && !("handle" in transition)
+        ),
+        true
+      );
+      assert.equal(
+        transitions.every(({ clickAttempted }) => clickAttempted === false),
+        true
       );
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
     } finally {
