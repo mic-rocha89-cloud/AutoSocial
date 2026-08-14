@@ -906,19 +906,32 @@ function createResponseTracker({ success = false, failure = null } = {}) {
   };
 }
 
+const EXPECTED_PUBLISH_OPERATION_BINDING = Object.freeze({
+  kind: "project",
+  value: "current-project",
+});
+
 function createPublishResponseHarness({
   payload = {
     code: 0,
-    data: { post_id: "7420000000000000001" },
+    data: {
+      project_id: "current-project",
+      post_id: "7420000000000000001",
+    },
   },
   requestUrl =
     "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=secret",
+  requestPayload = {
+    project_id: "current-project",
+    caption: "fixture caption",
+  },
 } = {}) {
   const page = new EventEmitter();
   page.url = () => "https://www.tiktok.com/tiktokstudio/upload";
   const request = {
     method: () => "POST",
-    postData: () => JSON.stringify({ project_id: "current-project" }),
+    postData: () => JSON.stringify(requestPayload),
+    postDataJSON: () => requestPayload,
     url: () => requestUrl,
   };
   const response = {
@@ -934,7 +947,10 @@ test("TikTok publish response becomes authoritative only for the bound operation
   const { page, request, response } = createPublishResponseHarness();
   const tracker = createPublishResponseTracker(page);
   try {
-    tracker.arm();
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
     tracker.beginClick("operation-fixture", {
       activeComposerMatched: true,
     });
@@ -945,6 +961,9 @@ test("TikTok publish response becomes authoritative only for the bound operation
     const evidence = tracker.success();
     assert.equal(isAuthoritativePublishEvidence(evidence), true);
     assert.equal(evidence.currentVideoMatched, true);
+    assert.equal(evidence.expectedCaptionMatched, true);
+    assert.equal(evidence.operationBindingMatched, true);
+    assert.equal(evidence.operationBindingKind, "project");
     assert.equal(evidence.operationId, "operation-fixture");
     assert.equal(evidence.postId, "7420000000000000001");
     assert.equal(
@@ -960,7 +979,10 @@ test("TikTok publish response remains unbound without the active composer proof"
   const { page, request, response } = createPublishResponseHarness();
   const tracker = createPublishResponseTracker(page);
   try {
-    tracker.arm();
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
     tracker.beginClick("operation-fixture", {
       activeComposerMatched: false,
     });
@@ -976,10 +998,64 @@ test("TikTok publish response remains unbound without the active composer proof"
   }
 });
 
+test("TikTok publish response remains unbound when the request caption differs", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "different caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without a pre-established operation binding", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({ expectedCaption: "fixture caption" });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
 test("TikTok publish response remains unbound without one valid returned post ID", async () => {
   for (const payload of [
     { code: 0, data: { project_id: "current-project" } },
     { code: 1001, data: { post_id: "7420000000000000001" } },
+    {
+      code: 0,
+      data: {
+        project_id: "current-project",
+        success: false,
+        status_code: 1001,
+        post_id: "7420000000000000001",
+      },
+    },
+    {
+      data: {
+        project_id: "current-project",
+        post_id: "7420000000000000001",
+      },
+    },
     { code: 0, data: { post_id: "not-a-post-id" } },
     {
       code: 0,
@@ -994,7 +1070,10 @@ test("TikTok publish response remains unbound without one valid returned post ID
     });
     const tracker = createPublishResponseTracker(page);
     try {
-      tracker.arm();
+      tracker.arm({
+        expectedCaption: "fixture caption",
+        expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+      });
       tracker.beginClick("operation-fixture", {
         activeComposerMatched: true,
       });
@@ -1016,7 +1095,10 @@ test("TikTok publish request observed before the click boundary is ignored", asy
   const { page, request, response } = createPublishResponseHarness();
   const tracker = createPublishResponseTracker(page);
   try {
-    tracker.arm();
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
     page.emit("request", request);
     tracker.beginClick("operation-fixture", {
       activeComposerMatched: true,
@@ -1024,6 +1106,81 @@ test("TikTok publish request observed before the click boundary is ignored", asy
     page.emit("response", response);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(tracker.success(), null);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound when request and response operation IDs differ", async () => {
+  const { page, request, response } = createPublishResponseHarness({
+    payload: {
+      code: 0,
+      data: {
+        project_id: "different-project",
+        post_id: "7420000000000000001",
+      },
+    },
+  });
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound after multiple candidate requests", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const secondRequestPayload = {
+    project_id: "other-project",
+    caption: "fixture caption",
+  };
+  const secondRequest = {
+    method: () => "POST",
+    postData: () => JSON.stringify(secondRequestPayload),
+    postDataJSON: () => secondRequestPayload,
+    url: () =>
+      "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=other",
+  };
+  const secondResponse = {
+    json: async () => ({
+      code: 0,
+      data: {
+        project_id: "other-project",
+        post_id: "7420000000000000002",
+      },
+    }),
+    request: () => secondRequest,
+    status: () => 200,
+    url: () => secondRequest.url(),
+  };
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("request", secondRequest);
+    page.emit("response", response);
+    page.emit("response", secondResponse);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
   } finally {
     tracker.dispose();
   }
@@ -3183,7 +3340,12 @@ test("TikTok never bypasses the incomplete-check transaction dialog", async (t) 
             requestStartedAfterClick: true,
             responseCompletedAfterClick: true,
             activeComposerMatched: binding.activeComposerMatched,
+            expectedCaptionMatched: true,
+            expectedOperationBindingMatched: true,
+            operationBindingMatched: true,
+            operationBindingKind: "project",
             currentVideoMatched: binding.activeComposerMatched,
+            candidateRequestCount: 1,
             operationId,
             postId: "7420000000000000001",
             postIdSource: "response-body",
@@ -3399,7 +3561,7 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
   await t.test("bound mocked publish response confirms the one-click operation", async () => {
     const page = await createPublishPage(browser, {
       onClick:
-        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/?session_token=fixture', {method:'POST'});",
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/?session_token=fixture', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
     });
     await page.unroute("https://www.tiktok.com/**");
     await page.route(
@@ -3408,7 +3570,10 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
         route.fulfill({
           body: JSON.stringify({
             code: 0,
-            data: { post_id: "7420000000000000001" },
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
           }),
           contentType: "application/json",
           status: 200,
@@ -3421,6 +3586,8 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
         fastPublishOptions({
           confirmationMaxPolls: 10,
           confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+          expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
         })
       );
       assert.equal(result.outcome, "success", JSON.stringify(result));
@@ -3437,10 +3604,51 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
     }
   });
 
+  await t.test("matching mocked response remains uncertain without a pre-established operation binding", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 3,
+          confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+        })
+      );
+      assert.equal(result.outcome, "uncertain", JSON.stringify(result));
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
   await t.test("two populated files keep a valid mocked response unbound", async () => {
     const page = await createPublishPage(browser, {
       onClick:
-        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST'});",
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
     });
     await page.locator("#upload-composer").evaluate((composer) => {
       const secondInput = document.createElement("input");
@@ -3460,7 +3668,10 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
         route.fulfill({
           body: JSON.stringify({
             code: 0,
-            data: { post_id: "7420000000000000001" },
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
           }),
           contentType: "application/json",
           status: 200,
@@ -3473,6 +3684,8 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
         fastPublishOptions({
           confirmationMaxPolls: 3,
           confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+          expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
         })
       );
       assert.equal(result.outcome, "uncertain");
