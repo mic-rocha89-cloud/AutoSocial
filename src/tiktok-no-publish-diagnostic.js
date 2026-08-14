@@ -20,6 +20,7 @@ const EXACT_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload";
 const READINESS_MAX_WAIT_MS = 12 * 60 * 1000;
 const READINESS_POLL_INTERVAL_MS = 5000;
 const READINESS_STABLE_POLLS = 2;
+const FILE_INPUT_WAIT_TIMEOUT_MS = 120000;
 const SUPPORTED_VIDEO_EXTENSIONS = new Set([
   ".mp4",
   ".mov",
@@ -425,6 +426,35 @@ function assertExactUploadPage(pageUrl) {
   }
 }
 
+async function waitForUniqueTikTokFileInput(
+  page,
+  { timeoutMs = FILE_INPUT_WAIT_TIMEOUT_MS } = {}
+) {
+  const fileInputs = page.locator('input[type="file"]');
+  try {
+    await fileInputs.first().waitFor({ state: "attached", timeout: timeoutMs });
+  } catch (error) {
+    assertExactUploadPage(page.url());
+    const observedCount = await fileInputs.count().catch(() => null);
+    const failure = new Error(
+      `Expected exactly one TikTok file input after a bounded wait, observed ${
+        Number.isInteger(observedCount) ? observedCount : "unknown"
+      }.`
+    );
+    failure.cause = error;
+    throw failure;
+  }
+
+  assertExactUploadPage(page.url());
+  const fileInputCount = await fileInputs.count();
+  if (fileInputCount !== 1) {
+    throw new Error(
+      `Expected exactly one TikTok file input, observed ${fileInputCount}.`
+    );
+  }
+  return fileInputs;
+}
+
 async function defaultLaunchPersistentContext(profileDir) {
   return chromium.launchPersistentContext(profileDir, {
     headless: false,
@@ -606,15 +636,7 @@ async function runTikTokNoPublishDiagnostic(options, overrides = {}) {
     await page.goto(EXACT_UPLOAD_URL, { waitUntil: "domcontentloaded" });
     assertExactUploadPage(page.url());
 
-    const fileInputs = page.locator('input[type="file"]');
-    const fileInputCount = await fileInputs.count();
-    if (fileInputCount !== 1) {
-      throw new Error(
-        `Expected exactly one TikTok file input, observed ${fileInputCount}.`
-      );
-    }
-    const fileInput = fileInputs.first();
-    await fileInput.waitFor({ state: "attached", timeout: 120000 });
+    const fileInput = await waitForUniqueTikTokFileInput(page);
     await fileInput.setInputFiles(validated.sourcePath);
     await captureScreenshot("input-assigned.png");
 
@@ -783,5 +805,6 @@ module.exports = {
     getTikTokRequestOrigin,
     safeResolutionResult,
     sanitizeRequestUrl,
+    waitForUniqueTikTokFileInput,
   },
 };

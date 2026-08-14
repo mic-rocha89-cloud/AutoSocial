@@ -189,6 +189,98 @@ test("queue snapshots are read only and detect metadata changes", async () => {
   }
 });
 
+test("TikTok file input hydration is bounded and remains fail closed", async () => {
+  let hydrated = false;
+  const uniqueInputs = {
+    async count() {
+      assert.equal(hydrated, true);
+      return 1;
+    },
+    first() {
+      return {
+        async waitFor(options) {
+          assert.deepEqual(options, { state: "attached", timeout: 25 });
+          hydrated = true;
+        },
+      };
+    },
+  };
+  const uniquePage = {
+    locator(selector) {
+      assert.equal(selector, 'input[type="file"]');
+      return uniqueInputs;
+    },
+    url() {
+      return "https://www.tiktok.com/tiktokstudio/upload";
+    },
+  };
+  assert.equal(
+    await _private.waitForUniqueTikTokFileInput(uniquePage, { timeoutMs: 25 }),
+    uniqueInputs
+  );
+
+  const duplicatePage = {
+    locator() {
+      return {
+        async count() {
+          return 2;
+        },
+        first() {
+          return { async waitFor() {} };
+        },
+      };
+    },
+    url: uniquePage.url,
+  };
+  await assert.rejects(
+    () =>
+      _private.waitForUniqueTikTokFileInput(duplicatePage, { timeoutMs: 25 }),
+    /exactly one TikTok file input, observed 2/i
+  );
+
+  const wrongPage = {
+    locator() {
+      return {
+        async count() {
+          return 1;
+        },
+        first() {
+          return { async waitFor() {} };
+        },
+      };
+    },
+    url() {
+      return "https://www.tiktok.com/login";
+    },
+  };
+  await assert.rejects(
+    () => _private.waitForUniqueTikTokFileInput(wrongPage, { timeoutMs: 25 }),
+    /exact Studio upload page/i
+  );
+
+  const missingPage = {
+    locator() {
+      return {
+        async count() {
+          return 0;
+        },
+        first() {
+          return {
+            async waitFor() {
+              throw new Error("fixture timeout");
+            },
+          };
+        },
+      };
+    },
+    url: uniquePage.url,
+  };
+  await assert.rejects(
+    () => _private.waitForUniqueTikTokFileInput(missingPage, { timeoutMs: 25 }),
+    /bounded wait, observed 0/i
+  );
+});
+
 test("TikTok diagnostic reaches resolution and records zero publication actions", async () => {
   const tree = await createTemporaryDiagnosticTree();
   const events = [];
@@ -206,6 +298,10 @@ test("TikTok diagnostic reaches resolution and records zero publication actions"
       assert.equal(selector, 'input[type="file"]');
       return {
         async count() {
+          assert.ok(
+            events.includes("input:attached"),
+            "file input uniqueness must be checked only after bounded hydration"
+          );
           return 1;
         },
         first() {
@@ -322,6 +418,10 @@ test("TikTok diagnostic reaches resolution and records zero publication actions"
       ["hydrating-check-structure", "ready"]
     );
     assert.equal(result.report.resolution.status, "unique");
+    assert.ok(
+      events.indexOf("input:attached") <
+        events.indexOf("input:approved-source.mp4")
+    );
     assert.ok(events.indexOf("readiness") < events.indexOf("preparation"));
     assert.ok(events.indexOf("preparation") < events.indexOf("resolution"));
     assert.ok(events.includes("target:disposed"));
