@@ -155,6 +155,114 @@ test("TikTok no-publish network guard aborts a classified request locally", asyn
   await guard.dispose();
 });
 
+test("TikTok no-publish guard records only fingerprinted operation bindings", async () => {
+  let routeHandler = null;
+  let responseHandler = null;
+  const page = {
+    async addInitScript() {},
+    frames() {
+      return [this];
+    },
+    async evaluate() {
+      return { blockedClickCount: 0 };
+    },
+    async route(_pattern, handler) {
+      routeHandler = handler;
+    },
+    async unroute() {},
+    on(event, handler) {
+      if (event === "response") {
+        responseHandler = handler;
+      }
+    },
+    off() {},
+  };
+  const guard = await installNoPublishGuards(page, {
+    isLikelyPublishRequest: () => false,
+  });
+  guard.beginOperationBindingCapture();
+
+  const request = {
+    method: () => "POST",
+    postDataJSON: () => ({
+      upload_id: "secret-upload-id",
+      project_id: "secret-project-id",
+      caption: "private caption",
+      access_token: "private-token",
+    }),
+    postData: () =>
+      JSON.stringify({ upload_id: "must-not-be-persisted" }),
+    url: () =>
+      "https://upload.tiktok.com/video/upload?project_id=secret-project-id&session_token=private-query-token",
+  };
+  let continued = false;
+  await routeHandler({
+    async abort() {
+      assert.fail("binding transport must not be aborted");
+    },
+    async continue() {
+      continued = true;
+    },
+    request: () => request,
+  });
+  responseHandler({
+    headers: async () => ({ "content-type": "application/json" }),
+    json: async () => ({
+      data: {
+        upload_id: "secret-upload-id",
+        project_id: "secret-project-id",
+        video_id: "server-video-id",
+      },
+      token: "private-response-token",
+    }),
+    request: () => request,
+    status: () => 200,
+  });
+
+  const state = await guard.getState();
+  assert.equal(continued, true);
+  assert.equal(state.operationBindingCapture.observationCount, 1);
+  assert.equal(state.operationBindingCapture.overflowCount, 0);
+  const [observation] = state.operationBindingCapture.observations;
+  assert.equal(observation.method, "POST");
+  assert.equal(observation.url, "https://upload.tiktok.com/video/upload");
+  assert.equal(observation.status, 200);
+  assert.deepEqual(
+    observation.requestBindings.map(({ kind }) => kind),
+    ["project", "upload"]
+  );
+  assert.deepEqual(
+    observation.responseBindings.map(({ kind }) => kind),
+    ["project", "upload", "video"]
+  );
+  assert.deepEqual(
+    observation.matchedBindings.map(({ kind }) => kind),
+    ["project", "upload"]
+  );
+  for (const binding of [
+    ...observation.requestBindings,
+    ...observation.responseBindings,
+    ...observation.matchedBindings,
+  ]) {
+    assert.match(binding.fingerprint, /^[0-9a-f]{64}$/);
+    assert.deepEqual(Object.keys(binding).sort(), ["fingerprint", "kind"]);
+  }
+  const serialized = JSON.stringify(state);
+  for (const secret of [
+    "secret-upload-id",
+    "secret-project-id",
+    "server-video-id",
+    "private caption",
+    "private-token",
+    "private-query-token",
+    "private-response-token",
+    "must-not-be-persisted",
+  ]) {
+    assert.doesNotMatch(serialized, new RegExp(secret));
+  }
+  await guard.dispose();
+});
+
 test("TikTok diagnostic source cannot alias a managed queue file", async () => {
   const tree = await createTemporaryDiagnosticTree();
   try {
