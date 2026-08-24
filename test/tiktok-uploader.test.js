@@ -14,6 +14,7 @@ const {
   collectTikTokPublishTargetResolutionDiagnostics,
   collectTikTokPublishReadinessInfo,
   collectUniquePublishTargets,
+  createPrePublishOperationBindingTracker,
   detectInterferingOverlays,
   dismissKnownTikTokEditorOnboarding,
   dismissKnownTikTokPrePublishOnboarding,
@@ -26,7 +27,9 @@ const {
   isLikelyPublishCandidateInfo,
   prepareTikTokPublishTargetForQualification,
   publishFailClosed,
+  resolveFinalPublishOperationBinding,
   setCaption,
+  setVideoFile,
   waitForPublishConfirmation,
   waitForTikTokPublishReadiness,
 } = _private;
@@ -868,6 +871,32 @@ test("TikTok final publish boundary binds the tracker synchronously before the o
   );
 });
 
+test("TikTok final publish boundary resolves the operation binding immediately before the one-shot guard", () => {
+  const source = clickPublishOnce.toString();
+  const finalBoundaryIndex = source.indexOf(
+    "const finalBoundaryInfo = await getPublishCandidateInfo"
+  );
+  const bindingResolutionIndex = source.indexOf(
+    "resolveFinalPublishOperationBinding",
+    finalBoundaryIndex
+  );
+  const trackerArmIndex = source.indexOf(
+    "publishResponseTracker.arm",
+    bindingResolutionIndex
+  );
+  const consumeIndex = source.indexOf("actionGuard.consume()");
+
+  assert.ok(finalBoundaryIndex >= 0);
+  assert.ok(bindingResolutionIndex > finalBoundaryIndex);
+  assert.ok(trackerArmIndex > bindingResolutionIndex);
+  assert.ok(trackerArmIndex < consumeIndex);
+  assert.ok(bindingResolutionIndex < consumeIndex);
+  assert.doesNotMatch(
+    source.slice(bindingResolutionIndex, consumeIndex),
+    /\bawait\b|waitFor|scroll|locator\(/
+  );
+});
+
 test("TikTok publish path contains no automatic overlay interaction", () => {
   const detectorSource = detectInterferingOverlays.toString();
   const uploadSource = uploadVideo.toString();
@@ -877,6 +906,31 @@ test("TikTok publish path contains no automatic overlay interaction", () => {
     uploadSource,
     /addDefaultSound\(|disableShortContentCheck\(/
   );
+});
+
+test("TikTok production upload captures the operation binding before file assignment", () => {
+  const source = uploadVideo.toString();
+  const assignmentSource = setVideoFile.toString();
+  const trackerIndex = source.indexOf("createPrePublishOperationBindingTracker");
+  const fileIndex = source.indexOf("setVideoFile");
+  const resolverIndex = source.indexOf("resolveExpectedOperationBinding");
+  const callbackIndex = assignmentSource.indexOf("beforeAssignment();");
+  const assignmentIndex = assignmentSource.indexOf("fileInput.setInputFiles");
+
+  assert.ok(trackerIndex >= 0);
+  assert.ok(trackerIndex < fileIndex);
+  assert.ok(fileIndex < resolverIndex);
+  assert.match(
+    source,
+    /setVideoFile[\s\S]+beforeAssignment:\s*\(\)\s*=>\s*operationBindingTracker\.arm\(\)/
+  );
+  assert.ok(callbackIndex >= 0);
+  assert.ok(callbackIndex < assignmentIndex);
+  assert.doesNotMatch(
+    assignmentSource.slice(callbackIndex, assignmentIndex),
+    /\bawait\b/
+  );
+  assert.match(source, /operationBindingTracker\.dispose\(\)/);
 });
 
 function createResponseTracker({ success = false, failure = null } = {}) {
@@ -909,6 +963,262 @@ function createResponseTracker({ success = false, failure = null } = {}) {
 const EXPECTED_PUBLISH_OPERATION_BINDING = Object.freeze({
   kind: "project",
   value: "current-project",
+});
+
+const EXPECTED_VIDEO_OPERATION_BINDING = Object.freeze({
+  kind: "video",
+  value: "current-video",
+});
+
+function createPrePublishBindingHarness({
+  method = "POST",
+  requestUrl =
+    "https://www.tiktok.com/tiktok/v1/creator/content/check/create/",
+  resourceType = "xhr",
+  navigation = false,
+  videoId = "current-video",
+  frameMatches = true,
+} = {}) {
+  const page = new EventEmitter();
+  const mainFrame = {};
+  const otherFrame = {};
+  page.url = () => "https://www.tiktok.com/tiktokstudio/upload";
+  page.mainFrame = () => mainFrame;
+  const requestPayload = videoId === null ? {} : { video_id: videoId };
+  const request = {
+    frame: () => (frameMatches ? mainFrame : otherFrame),
+    isNavigationRequest: () => navigation,
+    method: () => method,
+    postData: () => JSON.stringify(requestPayload),
+    postDataJSON: () => requestPayload,
+    resourceType: () => resourceType,
+    url: () => requestUrl,
+  };
+  return { page, request };
+}
+
+test("TikTok pre-publish tracker captures one stable current-video binding", () => {
+  const { page, request } = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    page.emit("request", request);
+
+    assert.deepEqual(tracker.resolve(), {
+      ok: true,
+      binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      matchingRequestCount: 2,
+    });
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker rejects missing and ambiguous video bindings", () => {
+  const missing = createPrePublishBindingHarness({
+    videoId: null,
+  });
+  const missingTracker = createPrePublishOperationBindingTracker(missing.page);
+  try {
+    missingTracker.arm();
+    missing.page.emit("request", missing.request);
+    assert.equal(missingTracker.resolve().ok, false);
+  } finally {
+    missingTracker.dispose();
+  }
+
+  const first = createPrePublishBindingHarness({
+    videoId: "first-video",
+  });
+  const secondPayload = { video_id: "second-video" };
+  const secondRequest = {
+    ...first.request,
+    postData: () => JSON.stringify(secondPayload),
+    postDataJSON: () => secondPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(first.page);
+  try {
+    tracker.arm();
+    first.page.emit("request", first.request);
+    first.page.emit("request", secondRequest);
+    const ambiguous = tracker.resolve();
+    assert.equal(ambiguous.ok, false);
+    assert.equal(ambiguous.reasonCode, "ambiguous-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker ignores untrusted transport lookalikes", () => {
+  const trusted = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(trusted.page);
+  try {
+    tracker.arm();
+    for (const options of [
+      { requestUrl: "https://example.com/tiktok/v1/creator/content/check/create/" },
+      { requestUrl: "https://www.tiktok.com/tiktok/v1/creator/content/check/status/" },
+      { method: "GET" },
+      { resourceType: "document" },
+      { navigation: true },
+      { frameMatches: false },
+    ]) {
+      trusted.page.emit(
+        "request",
+        createPrePublishBindingHarness(options).request
+      );
+    }
+
+    const resolution = tracker.resolve();
+    assert.equal(resolution.ok, false);
+    assert.equal(resolution.reasonCode, "binding-not-observed");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker rejects conflicting query and body video IDs", () => {
+  const { page, request } = createPrePublishBindingHarness({
+    requestUrl:
+      "https://www.tiktok.com/tiktok/v1/creator/content/check/create/?video_id=query-video",
+    videoId: "body-video",
+  });
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    const resolution = tracker.resolve();
+    assert.equal(resolution.ok, false);
+    assert.equal(resolution.reasonCode, "invalid-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding rejects a video ID introduced after an earlier valid snapshot", () => {
+  const first = createPrePublishBindingHarness({ videoId: "first-video" });
+  const secondPayload = { video_id: "second-video" };
+  const secondRequest = {
+    ...first.request,
+    postData: () => JSON.stringify(secondPayload),
+    postDataJSON: () => secondPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(first.page);
+  try {
+    tracker.arm();
+    first.page.emit("request", first.request);
+    assert.equal(tracker.resolve().ok, true);
+
+    first.page.emit("request", secondRequest);
+    const finalResolution = resolveFinalPublishOperationBinding(
+      null,
+      () => tracker.resolve()
+    );
+    assert.equal(finalResolution.ok, false);
+    assert.equal(finalResolution.reasonCode, "ambiguous-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding rejects a late invalid matching request", () => {
+  const valid = createPrePublishBindingHarness({ videoId: "current-video" });
+  const invalidPayload = {};
+  const invalidRequest = {
+    ...valid.request,
+    postData: () => JSON.stringify(invalidPayload),
+    postDataJSON: () => invalidPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(valid.page);
+  try {
+    tracker.arm();
+    valid.page.emit("request", valid.request);
+    assert.equal(tracker.resolve().ok, true);
+
+    valid.page.emit("request", invalidRequest);
+    const finalResolution = resolveFinalPublishOperationBinding(
+      null,
+      () => tracker.resolve()
+    );
+    assert.equal(finalResolution.ok, false);
+    assert.equal(finalResolution.reasonCode, "invalid-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding preserves one stable duplicated video ID", () => {
+  const { page, request } = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    page.emit("request", request);
+
+    assert.deepEqual(
+      resolveFinalPublishOperationBinding(null, () => tracker.resolve()),
+      {
+        ok: true,
+        binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      }
+    );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding preserves the static fallback and rejects resolver failures", () => {
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(
+      EXPECTED_VIDEO_OPERATION_BINDING,
+      null
+    ),
+    {
+      ok: true,
+      binding: EXPECTED_VIDEO_OPERATION_BINDING,
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => ({
+      ok: false,
+      reasonCode: "binding-not-observed",
+    })),
+    {
+      ok: false,
+      reasonCode: "binding-not-observed",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => {
+      throw new Error("fixture resolver failure");
+    }),
+    {
+      ok: false,
+      reasonCode: "binding-resolution-failed",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () =>
+      Promise.resolve({
+        ok: true,
+        binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      })
+    ),
+    {
+      ok: false,
+      reasonCode: "async-binding-resolution-rejected",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => ({
+      ok: true,
+      binding: { kind: "video", value: "invalid binding value" },
+    })),
+    {
+      ok: false,
+      reasonCode: "invalid-operation-binding",
+    }
+  );
 });
 
 function createPublishResponseHarness({
@@ -970,6 +1280,42 @@ test("TikTok publish response becomes authoritative only for the bound operation
       evidence.url,
       "https://www.tiktok.com/tiktok/web/project/post/v1/"
     );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response binds through its exact request when the body does not echo the video ID", async () => {
+  const { page, request, response } = createPublishResponseHarness({
+    payload: {
+      code: 0,
+      data: {
+        post_id: "7420000000000000001",
+      },
+    },
+    requestPayload: {
+      video_id: "current-video",
+      caption: "fixture caption",
+    },
+  });
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_VIDEO_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), true);
+    assert.equal(evidence.operationBindingKind, "video");
+    assert.equal(evidence.operationBindingSource, "request-response-identity");
+    assert.equal(evidence.postId, "7420000000000000001");
   } finally {
     tracker.dispose();
   }
@@ -2773,7 +3119,7 @@ test("TikTok publish readiness is structural, bounded, and revalidated", async (
         }, 10);
       }, SAFE_CONTENT_CHECK_STATUS);
       const result = await waitForTikTokPublishReadiness(page, {
-        maxWaitMs: 200,
+        maxWaitMs: 1000,
         pollIntervalMs: 5,
         requiredStablePolls: 2,
       });
@@ -3558,6 +3904,28 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
   const browser = await chromium.launch({ headless: true });
   t.after(() => browser.close());
 
+  await t.test("missing captured operation binding aborts before the publish click", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          resolveExpectedOperationBinding: () => ({
+            ok: false,
+            reasonCode: "binding-not-observed",
+          }),
+        })
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.retryAllowed, true);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
   await t.test("bound mocked publish response confirms the one-click operation", async () => {
     const page = await createPublishPage(browser, {
       onClick:
@@ -3587,7 +3955,10 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
           confirmationMaxPolls: 10,
           confirmationPollIntervalMs: 10,
           expectedCaption: "fixture caption",
-          expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+          resolveExpectedOperationBinding: () => ({
+            ok: true,
+            binding: EXPECTED_PUBLISH_OPERATION_BINDING,
+          }),
         })
       );
       assert.equal(result.outcome, "success", JSON.stringify(result));

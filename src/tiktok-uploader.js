@@ -29,10 +29,14 @@ async function gotoUploadPage(page) {
   await page.goto(config.uploadPageUrl, { waitUntil: "domcontentloaded" });
 }
 
-async function setVideoFile(page, videoPath) {
+async function setVideoFile(page, videoPath, { beforeAssignment } = {}) {
   const fileInput = page.locator('input[type="file"]').first();
   await fileInput.waitFor({ state: "attached", timeout: 120000 });
-  await fileInput.setInputFiles(videoPath);
+  if (typeof beforeAssignment === "function") {
+    beforeAssignment();
+  }
+  const assignment = fileInput.setInputFiles(videoPath);
+  await assignment;
 }
 
 async function setCaption(page, caption) {
@@ -2533,6 +2537,9 @@ async function clickPublishOnce(
     beforeClick,
     publishResponseTracker,
     operationId,
+    expectedCaption,
+    expectedOperationBinding,
+    resolveExpectedOperationBinding,
   } = {}
 ) {
   const overlayState = await detectInterferingOverlays(page);
@@ -2650,6 +2657,47 @@ async function clickPublishOnce(
         clickAttempted: false,
         reason:
           "TikTok Publish/Post target qualification changed immediately before click.",
+      };
+    }
+
+    const finalBindingResolution = resolveFinalPublishOperationBinding(
+      expectedOperationBinding,
+      resolveExpectedOperationBinding
+    );
+    if (!finalBindingResolution.ok) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish operation binding was not uniquely established " +
+          "at the final Publish/Post action boundary.",
+        evidence: {
+          type: "pre-publish-operation-binding",
+          reasonCode: finalBindingResolution.reasonCode,
+        },
+      };
+    }
+    try {
+      if (
+        publishResponseTracker &&
+        typeof publishResponseTracker.arm === "function"
+      ) {
+        publishResponseTracker.arm({
+          expectedCaption,
+          expectedOperationBinding: finalBindingResolution.binding,
+        });
+      }
+    } catch {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish response tracking could not be armed at the " +
+          "final action boundary.",
       };
     }
 
@@ -2819,6 +2867,9 @@ const PUBLISH_OPERATION_BINDING_KEYS = new Map([
   ["uploadId", "upload"],
 ]);
 
+const PRE_PUBLISH_VIDEO_BINDING_PATH =
+  /^\/tiktok\/v\d+\/creator\/content\/check\/create\/?$/i;
+
 function normalizePublishOperationBinding(value) {
   if (typeof value !== "string") {
     return null;
@@ -2837,6 +2888,43 @@ function normalizeExpectedPublishOperationBinding(binding) {
     return null;
   }
   return { kind, value };
+}
+
+function resolveFinalPublishOperationBinding(
+  expectedOperationBinding,
+  resolveExpectedOperationBinding
+) {
+  const fallbackBinding = normalizeExpectedPublishOperationBinding(
+    expectedOperationBinding
+  );
+  if (typeof resolveExpectedOperationBinding !== "function") {
+    return { ok: true, binding: fallbackBinding };
+  }
+
+  let bindingResolution;
+  try {
+    bindingResolution = resolveExpectedOperationBinding();
+  } catch {
+    return { ok: false, reasonCode: "binding-resolution-failed" };
+  }
+  if (
+    bindingResolution &&
+    typeof bindingResolution.then === "function"
+  ) {
+    return { ok: false, reasonCode: "async-binding-resolution-rejected" };
+  }
+
+  const binding = normalizeExpectedPublishOperationBinding(
+    bindingResolution?.binding
+  );
+  if (bindingResolution?.ok !== true || !binding) {
+    return {
+      ok: false,
+      reasonCode:
+        bindingResolution?.reasonCode || "invalid-operation-binding",
+    };
+  }
+  return { ok: true, binding };
 }
 
 function inspectPublishPayload(payload) {
@@ -3035,8 +3123,137 @@ function inspectPublishRequestPayload(payload, expectedCaption) {
   return { bindingValues, expectedCaptionMatched };
 }
 
-function matchPublishOperationBinding(requestBindings, responseBindings) {
-  if (!requestBindings || !responseBindings) {
+function mergePublishOperationBindings(target, source) {
+  for (const [kind, values] of source || []) {
+    const targetValues = target.get(kind) || new Set();
+    for (const value of values) {
+      targetValues.add(value);
+    }
+    target.set(kind, targetValues);
+  }
+  return target;
+}
+
+function getPublishRequestOperationBindings(request, payload) {
+  const bindings = new Map();
+  try {
+    const parsedUrl = new URL(request.url());
+    for (const [key, entry] of parsedUrl.searchParams) {
+      const bindingKind = PUBLISH_OPERATION_BINDING_KEYS.get(key);
+      const bindingValue = normalizePublishOperationBinding(entry);
+      if (bindingKind && bindingValue) {
+        const values = bindings.get(bindingKind) || new Set();
+        values.add(bindingValue);
+        bindings.set(bindingKind, values);
+      }
+    }
+  } catch {
+    // The caller's transport classifier rejects unparseable URLs.
+  }
+
+  const payloadEvidence = inspectPublishRequestPayload(payload, null);
+  return mergePublishOperationBindings(
+    bindings,
+    payloadEvidence?.bindingValues
+  );
+}
+
+function isTrustedPrePublishVideoBindingRequest(page, request, expectedOrigin) {
+  try {
+    if (request.method().toUpperCase() !== "POST") {
+      return false;
+    }
+    const parsedUrl = new URL(request.url());
+    if (
+      !expectedOrigin ||
+      parsedUrl.origin !== expectedOrigin ||
+      !PRE_PUBLISH_VIDEO_BINDING_PATH.test(parsedUrl.pathname)
+    ) {
+      return false;
+    }
+    if (request.isNavigationRequest() !== false) {
+      return false;
+    }
+    if (!["fetch", "xhr"].includes(request.resourceType())) {
+      return false;
+    }
+    return request.frame() === page.mainFrame();
+  } catch {
+    return false;
+  }
+}
+
+function createPrePublishOperationBindingTracker(page) {
+  let armed = false;
+  let expectedOrigin = null;
+  let matchingRequestCount = 0;
+  let invalidRequestCount = 0;
+  let videoBindings = new Set();
+
+  const requestHandler = (request) => {
+    if (
+      !armed ||
+      !isTrustedPrePublishVideoBindingRequest(page, request, expectedOrigin)
+    ) {
+      return;
+    }
+    matchingRequestCount += 1;
+    const payload = getPublishRequestPayload(request);
+    const bindings = getPublishRequestOperationBindings(request, payload);
+    const values = bindings.get("video");
+    if (!values || values.size !== 1) {
+      invalidRequestCount += 1;
+      return;
+    }
+    videoBindings.add([...values][0]);
+  };
+
+  page.on("request", requestHandler);
+
+  return {
+    arm() {
+      expectedOrigin = getExpectedOrigin(page.url());
+      matchingRequestCount = 0;
+      invalidRequestCount = 0;
+      videoBindings = new Set();
+      armed = true;
+    },
+    resolve() {
+      if (!armed) {
+        return { ok: false, reasonCode: "binding-capture-not-armed" };
+      }
+      if (matchingRequestCount === 0) {
+        return { ok: false, reasonCode: "binding-not-observed" };
+      }
+      if (invalidRequestCount > 0) {
+        return { ok: false, reasonCode: "invalid-video-binding" };
+      }
+      if (videoBindings.size !== 1) {
+        return { ok: false, reasonCode: "ambiguous-video-binding" };
+      }
+      return {
+        ok: true,
+        binding: { kind: "video", value: [...videoBindings][0] },
+        matchingRequestCount,
+      };
+    },
+    dispose() {
+      armed = false;
+      page.off("request", requestHandler);
+    },
+  };
+}
+
+function matchPublishOperationBinding(
+  requestBindings,
+  responseBindings,
+  expectedBinding
+) {
+  if (
+    !requestBindings ||
+    !responseBindings ||
+    !hasExpectedPublishOperationBinding(requestBindings, expectedBinding)
+  ) {
     return null;
   }
   const matchedKinds = [];
@@ -3054,7 +3271,16 @@ function matchPublishOperationBinding(requestBindings, responseBindings) {
     }
     matchedKinds.push(kind);
   }
-  return matchedKinds.length > 0 ? matchedKinds.sort().join("+") : null;
+  return {
+    kind:
+      matchedKinds.length > 0
+        ? matchedKinds.sort().join("+")
+        : expectedBinding.kind,
+    source:
+      matchedKinds.length > 0
+        ? "request-response-echo"
+        : "request-response-identity",
+  };
 }
 
 function hasExpectedPublishOperationBinding(bindings, expectedBinding) {
@@ -3108,11 +3334,13 @@ function createPublishResponseTracker(page) {
         payload,
         expectedCaption
       );
+      const bindingValues = getPublishRequestOperationBindings(request, payload);
       startedRequests.set(request, requestEvidence && {
         ...requestEvidence,
+        bindingValues,
         expectedOperationBindingMatched:
           hasExpectedPublishOperationBinding(
-            requestEvidence.bindingValues,
+            bindingValues,
             expectedOperationBinding
           ),
       });
@@ -3173,19 +3401,17 @@ function createPublishResponseTracker(page) {
             return;
           }
           const inspectedPayload = inspectPublishPayload(payload);
-          const operationBindingKind = matchPublishOperationBinding(
+          const matchedOperationBinding = matchPublishOperationBinding(
             requestEvidence.bindingValues,
-            inspectedPayload?.operationBindings
+            inspectedPayload?.operationBindings,
+            expectedOperationBinding
           );
           const expectedOperationBindingMatched =
             requestEvidence.expectedOperationBindingMatched &&
-            hasExpectedPublishOperationBinding(
-              inspectedPayload?.operationBindings,
-              expectedOperationBinding
-            );
+            Boolean(matchedOperationBinding);
           if (
             !inspectedPayload ||
-            !operationBindingKind ||
+            !matchedOperationBinding ||
             !expectedOperationBindingMatched ||
             operationAmbiguous ||
             candidateRequestCount !== 1
@@ -3200,7 +3426,8 @@ function createPublishResponseTracker(page) {
             postIdSource: "response-body",
             expectedOperationBindingMatched,
             operationBindingMatched: true,
-            operationBindingKind,
+            operationBindingKind: matchedOperationBinding.kind,
+            operationBindingSource: matchedOperationBinding.source,
             currentVideoMatched,
           };
           if (currentVideoMatched && responseOperationId) {
@@ -3537,6 +3764,7 @@ async function publishFailClosed(
     beforeFinalValidation,
     expectedCaption,
     expectedOperationBinding,
+    resolveExpectedOperationBinding,
   } = {}
 ) {
   const overlayState = await detectInterferingOverlays(page);
@@ -3587,12 +3815,12 @@ async function publishFailClosed(
         baselineSurfaces =
           await captureVisiblePublishConfirmationSurfaces(page);
         startedUrl = page.url();
-        if (typeof tracker.arm === "function") {
-          tracker.arm({ expectedCaption, expectedOperationBinding });
-        }
       },
       publishResponseTracker: tracker,
       operationId,
+      expectedCaption,
+      expectedOperationBinding,
+      resolveExpectedOperationBinding,
     });
     if (!clickResult.ok) {
       return clickResult;
@@ -3712,6 +3940,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
   const context = await openPersistentContext(accountId);
   const page = context.pages()[0] || (await context.newPage());
   let closeHoldMs = 0;
+  let operationBindingTracker = null;
   let publishResponseTracker = null;
 
   try {
@@ -3722,7 +3951,10 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       );
     }
     await gotoUploadPage(page);
-    await setVideoFile(page, absoluteVideoPath);
+    operationBindingTracker = createPrePublishOperationBindingTracker(page);
+    await setVideoFile(page, absoluteVideoPath, {
+      beforeAssignment: () => operationBindingTracker.arm(),
+    });
     await waitForUploadReady(page);
     const effectiveCaption = caption || config.defaultCaption;
     await setCaption(page, effectiveCaption);
@@ -3730,7 +3962,11 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
     const confirmation = await publishFailClosed(
       page,
       publishResponseTracker,
-      { expectedCaption: effectiveCaption }
+      {
+        expectedCaption: effectiveCaption,
+        resolveExpectedOperationBinding: () =>
+          operationBindingTracker.resolve(),
+      }
     );
     if (!confirmation.ok) {
       const error = new Error(
@@ -3771,6 +4007,9 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
     closeHoldMs = Math.max(config.failureHoldMs, 0);
     return buildTikTokUploadFailureResult(error, screenshotPath);
   } finally {
+    if (operationBindingTracker) {
+      operationBindingTracker.dispose();
+    }
     if (publishResponseTracker) {
       publishResponseTracker.dispose();
     }
@@ -3795,6 +4034,7 @@ module.exports = {
     collectTikTokPublishReadinessInfo,
     collectUniquePublishTargets,
     collectPublishCandidateDiagnostics,
+    createPrePublishOperationBindingTracker,
     createPublishActionGuard,
     createPublishResponseTracker,
     detectInterferingOverlays,
@@ -3809,7 +4049,9 @@ module.exports = {
     isLikelyPublishCandidateInfo,
     publishFailClosed,
     prepareTikTokPublishTargetForQualification,
+    resolveFinalPublishOperationBinding,
     setCaption,
+    setVideoFile,
     waitForTikTokPublishReadiness,
     waitForPublishConfirmation,
   },
