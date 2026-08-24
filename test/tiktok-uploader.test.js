@@ -1,19 +1,69 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const { chromium } = require("playwright");
 
 const { uploadVideo, _private } = require("../src/tiktok-uploader");
 
 const {
+  buildTikTokUploadFailureResult,
+  classifyPublishCandidateInfo,
+  classifyTikTokPublishReadinessInfo,
   clickPublishOnce,
+  collectPublishCandidateDiagnostics,
+  collectTikTokPublishTargetResolutionDiagnostics,
+  collectTikTokPublishReadinessInfo,
   collectUniquePublishTargets,
+  createPrePublishOperationBindingTracker,
   detectInterferingOverlays,
+  dismissKnownTikTokEditorOnboarding,
+  dismissKnownTikTokPrePublishOnboarding,
+  findUniquePublishTarget,
+  getPublishClickAttempted,
   getPublishCandidateScore,
+  createPublishResponseTracker,
+  isAuthoritativePublishEvidence,
   isLikelyPublishApiResponse,
   isLikelyPublishCandidateInfo,
+  prepareTikTokPublishTargetForQualification,
   publishFailClosed,
+  resolveFinalPublishOperationBinding,
   setCaption,
+  setVideoFile,
+  waitForPublishConfirmation,
+  waitForTikTokPublishReadiness,
 } = _private;
+
+test("TikTok pre-publish errors explicitly serialize publish clickAttempted false", () => {
+  assert.equal(getPublishClickAttempted(new Error("pre-publish failure")), false);
+  assert.equal(getPublishClickAttempted({ clickAttempted: false }), false);
+  assert.equal(getPublishClickAttempted({ clickAttempted: true }), true);
+});
+
+test("TikTok upload failure serialization preserves resolution diagnostics", () => {
+  const diagnostics = {
+    schemaVersion: 1,
+    directPostCount: 1,
+    finalTargetCount: 0,
+  };
+  const error = new Error("Publish verification failed: target unavailable");
+  error.outcome = "failure";
+  error.retryAllowed = true;
+  error.reason = "target unavailable";
+  error.diagnostics = diagnostics;
+  error.clickAttempted = false;
+
+  const result = buildTikTokUploadFailureResult(
+    error,
+    "last-upload-error.png"
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, "failure");
+  assert.equal(result.retryAllowed, true);
+  assert.equal(result.clickAttempted, false);
+  assert.equal(result.reason, "target unavailable");
+  assert.deepEqual(result.diagnostics, diagnostics);
+});
 
 test("TikTok publish candidate rejects the Studio sidebar Posts item", () => {
   const candidate = {
@@ -135,6 +185,94 @@ test("TikTok secondary confirm terms reject plain Post and sidebar Posts", () =>
   assert.equal(getPublishCandidateScore(bottomButton, secondaryTerms), -1);
 });
 
+test("TikTok publish diagnostics explain candidates without clicking", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+
+  await page.setContent(`
+    <style>
+      #valid-publish { bottom: 20px; height: 44px; position: fixed; right: 20px; width: 160px; }
+    </style>
+    <nav id="studio-sidebar">
+      <button id="sidebar-posts" onclick="window.publishDiagnosticClicks += 1">Posts</button>
+      <button id="sidebar-post" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    </nav>
+    <form id="upload-form" action="/tiktokstudio/upload">
+      <input id="upload-input" type="file" accept="video/*">
+      <button
+        id="valid-publish"
+        class="TUXButton publish-button"
+        data-e2e="post_video_button"
+        data-testid="publish-action"
+        type="submit"
+        onclick="event.preventDefault(); window.publishDiagnosticClicks += 1"
+      ><span>Post</span></button>
+    </form>
+    <button id="disabled-post" disabled onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <button id="aria-disabled-post" aria-disabled="true" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <button id="invisible-post" style="display:none" onclick="window.publishDiagnosticClicks += 1">Post</button>
+    <script>window.publishDiagnosticClicks = 0;</script>
+  `);
+  await page.locator("#upload-input").setInputFiles({
+    name: "fixture.mp4",
+    mimeType: "video/mp4",
+    buffer: Buffer.from("local fixture"),
+  });
+
+  const diagnostics = await collectPublishCandidateDiagnostics(page);
+  const byId = new Map(diagnostics.candidates.map((candidate) => [candidate.id, candidate]));
+
+  assert.equal(diagnostics.qualifiedTargetCount, 1);
+  assert.equal(byId.get("valid-publish").status, "ACCEPTED");
+  assert.deepEqual(byId.get("valid-publish").reasons, ["qualified"]);
+  assert.deepEqual(byId.get("valid-publish").locatorSources.sort(), [
+    "exact-role",
+    "semantic-clickable",
+  ]);
+  assert.equal(byId.get("valid-publish").tagName, "BUTTON");
+  assert.equal(byId.get("valid-publish").type, "submit");
+  assert.equal(byId.get("valid-publish").structuralBinding, "active-upload-form");
+  assert.equal(byId.get("valid-publish").nearestButtonOwner.tagName, "BUTTON");
+  assert.equal(byId.get("valid-publish").documentPopulatedFileInputCount, 1);
+  assert.equal(
+    byId
+      .get("valid-publish")
+      .ancestorChain.find((ancestor) => ancestor.id === "upload-form")
+      .populatedFileInputCount,
+    1
+  );
+  assert.deepEqual(byId.get("sidebar-posts").reasons, ["inside-navigation"]);
+  assert.deepEqual(byId.get("sidebar-post").reasons, ["inside-navigation"]);
+  assert.deepEqual(byId.get("disabled-post").reasons, ["disabled"]);
+  assert.deepEqual(byId.get("aria-disabled-post").reasons, ["disabled"]);
+  assert.deepEqual(byId.get("invisible-post").reasons, ["invisible"]);
+  assert.equal(await page.evaluate(() => window.publishDiagnosticClicks), 0);
+  assert.doesNotMatch(
+    collectPublishCandidateDiagnostics.toString(),
+    /\.click\(|keyboard\.|mouse\./
+  );
+});
+
+test("TikTok candidate classifier rejects conflicting visible and ARIA identities", () => {
+  const classification = classifyPublishCandidateInfo({
+    ariaLabel: "Delete",
+    disabled: false,
+    inNavigation: false,
+    rect: { left: 900, right: 1060, top: 780, width: 160, height: 44 },
+    role: "",
+    structuralBinding: "active-upload-form",
+    tagName: "button",
+    text: "Post",
+    visible: true,
+    viewportHeight: 900,
+    viewportWidth: 1200,
+  });
+
+  assert.equal(classification.qualified, false);
+  assert.deepEqual(classification.reasons, ["text-aria-mismatch"]);
+});
+
 test("TikTok caption flow refuses a blocking dialog without clicking it", async (t) => {
   const browser = await chromium.launch({ headless: true });
   t.after(() => browser.close());
@@ -181,7 +319,527 @@ test("TikTok caption flow refuses a blocking dialog without clicking it", async 
   );
 });
 
-test("TikTok final publish boundary has no setup call after owner validation", () => {
+const KNOWN_EDITOR_ONBOARDING_TITLE = "New editing features added";
+const KNOWN_EDITOR_ONBOARDING_BODY =
+  "Now it's easier than ever before to create professional and engaging videos.";
+const KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE =
+  "Preview your video on your phone";
+const KNOWN_PHONE_PREVIEW_ONBOARDING_BODY =
+  "Now you can view your video as it will appear on TikTok.";
+
+function editorOnboardingMarkup({
+  id = "editor-onboarding",
+  title = KNOWN_EDITOR_ONBOARDING_TITLE,
+  body = KNOWN_EDITOR_ONBOARDING_BODY,
+  buttonLabel = "Got it",
+  hidden = false,
+  onClick =
+    "window.onboardingClicks += 1; this.closest('[role=dialog]').remove()",
+} = {}) {
+  return `
+    <div id="${id}" class="test-dialog" role="dialog"${
+      hidden ? ' style="display: none"' : ""
+    }>
+      <h2>${title}</h2>
+      <p>${body}</p>
+      <button type="button" onclick="${onClick}">${buttonLabel}</button>
+    </div>
+  `;
+}
+
+function phonePreviewOnboardingMarkup({
+  id = "phone-preview-onboarding",
+  title = KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+  body = KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+  buttonLabel = "Got it",
+  hidden = false,
+  extraButtonMarkup = "",
+  onClick =
+    "window.phonePreviewClicks += 1; this.closest('[aria-modal=true]').remove()",
+} = {}) {
+  return `
+    <div id="${id}" class="react-joyride__tooltip" role="alertdialog" aria-modal="true" aria-label="${title}${body}${buttonLabel}"${
+      hidden ? ' style="display: none"' : ""
+    }>
+      <div>
+        <img alt="" />
+        <div class="tutorial-tooltip__title">${title}</div>
+        <div class="tutorial-tooltip__desc">${body}</div>
+        <div class="tutorial-tooltip__footer">
+          <button type="button" role="button" aria-disabled="false" onclick="${onClick}">
+            <div class="Button__content">${buttonLabel}</div>
+          </button>
+          ${extraButtonMarkup}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function createCaptionPage(browser, { content = "", decoy = false } = {}) {
+  const page = await browser.newPage();
+  await page.setContent(`
+    <style>
+      .test-dialog {
+        background: white;
+        height: 240px;
+        left: 300px;
+        position: fixed;
+        top: 120px;
+        width: 360px;
+        z-index: 10;
+      }
+    </style>
+    <div id="description" role="textbox" contenteditable="true">generated filename</div>
+    ${
+      decoy
+        ? '<button id="external-decoy" onclick="window.decoyClicks += 1">Got it</button>'
+        : ""
+    }
+    ${content}
+    <script>
+      window.decoyClicks = 0;
+      window.onboardingClicks = 0;
+      window.phonePreviewClicks = 0;
+      window.publishClickCount = 0;
+      window.unknownDialogClicks = 0;
+    </script>
+  `);
+  return page;
+}
+
+test("TikTok safely dismisses only the exact phone-preview onboarding", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const caption = "Controlled AutoSocial QA caption.";
+
+  await t.test("exact real-DOM fingerprint can be dismissed before caption editing", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("changed title remains blocked with zero clicks", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        title: "Preview your post on your phone",
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "materially changed body remains blocked with zero clicks",
+      content: phonePreviewOnboardingMarkup({
+        body: "Review your video and accept the updated publishing terms.",
+      }),
+    },
+    {
+      name: "changed action remains blocked with zero clicks",
+      content: phonePreviewOnboardingMarkup({ buttonLabel: "Continue" }),
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createCaptionPage(browser, { content: scenario.content });
+      try {
+        await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+        assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+        assert.equal(
+          await page.locator("#description").textContent(),
+          "generated filename"
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("external Got it decoy is ignored", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+      decoy: true,
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.evaluate(() => window.decoyClicks), 0);
+      assert.equal(await page.locator("#external-decoy").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known phone preview plus another dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        phonePreviewOnboardingMarkup() +
+        '<div id="unknown-dialog" class="test-dialog" role="dialog"><button onclick="window.unknownDialogClicks += 1">Close</button></div>',
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two identical phone-preview dialogs fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        phonePreviewOnboardingMarkup({ id: "phone-preview-one" }) +
+        phonePreviewOnboardingMarkup({ id: "phone-preview-two" }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two Got it buttons inside the dialog fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        extraButtonMarkup:
+          '<button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 100">Got it</button>',
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("hidden phone-preview markup is not interacted with", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({ hidden: true }),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("correct text in an unverified generic dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({
+        title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+        body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("phone preview is refused outside the pre-caption phase", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "final-publish",
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("dialog removed before revalidation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "pre-caption",
+        beforeFinalValidation: async () => {
+          await page.locator("#phone-preview-onboarding").evaluate((dialog) =>
+            dialog.remove()
+          );
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("same-label replacement button receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokPrePublishOnboarding(page, {
+        phase: "pre-caption",
+        beforeFinalValidation: async () => {
+          await page.locator("#phone-preview-onboarding button").evaluate((button) => {
+            button.replaceWith(button.cloneNode(true));
+          });
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reappearing phone preview consumes one dismiss and fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content: phonePreviewOnboardingMarkup({
+        onClick:
+          "window.phonePreviewClicks += 1; const dialog = this.closest('[aria-modal=true]'); const replacement = dialog.cloneNode(true); replacement.id = 'phone-preview-again'; dialog.replaceWith(replacement)",
+      }),
+    });
+    const messages = [];
+    const originalLog = console.log;
+    console.log = (message) => messages.push(String(message));
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 1);
+      assert.equal(await page.locator("#phone-preview-again").count(), 1);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+      assert.ok(
+        messages.includes(
+          "Known TikTok phone-preview onboarding dialog reappeared after allowed dismiss; failing closed."
+        )
+      );
+    } finally {
+      console.log = originalLog;
+      await page.close();
+    }
+  });
+});
+
+test("TikTok safely dismisses only the exact known editor onboarding", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const caption = "Controlled AutoSocial QA caption.";
+
+  await t.test("exact single onboarding is dismissed once before caption editing", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.locator("#editor-onboarding").count(), 0);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "changed title fails closed",
+      content: editorOnboardingMarkup({
+        title: "New publishing features added",
+      }),
+    },
+    {
+      name: "materially changed body fails closed",
+      content: editorOnboardingMarkup({
+        body: "Review the post and confirm that you accept the updated terms.",
+      }),
+    },
+    {
+      name: "changed button fails closed",
+      content: editorOnboardingMarkup({ buttonLabel: "Continue" }),
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createCaptionPage(browser, { content: scenario.content });
+      try {
+        await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+        assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+        assert.equal(
+          await page.locator("#description").textContent(),
+          "generated filename"
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("external Got it decoy is never selected", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+      decoy: true,
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.evaluate(() => window.decoyClicks), 0);
+      assert.equal(await page.locator("#external-decoy").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known onboarding plus another visible dialog fails closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        editorOnboardingMarkup() +
+        '<div id="unknown-dialog" class="test-dialog" role="dialog"><button onclick="window.unknownDialogClicks += 1">Close</button></div>',
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two identical onboarding candidates fail closed", async () => {
+    const page = await createCaptionPage(browser, {
+      content:
+        editorOnboardingMarkup({ id: "editor-onboarding-one" }) +
+        editorOnboardingMarkup({ id: "editor-onboarding-two" }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("hidden onboarding remains untouched and is not an active blocker", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({ hidden: true }),
+    });
+    try {
+      await setCaption(page, caption);
+      assert.equal(await page.locator("#editor-onboarding").count(), 1);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+      assert.equal(await page.locator("#description").textContent(), caption);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("dialog disappearing before final validation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokEditorOnboarding(page, {
+        beforeFinalValidation: async () => {
+          await page.locator("#editor-onboarding").evaluate((dialog) => dialog.remove());
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("button replacement before final validation receives no click", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup(),
+    });
+    try {
+      const result = await dismissKnownTikTokEditorOnboarding(page, {
+        beforeFinalValidation: async () => {
+          await page.locator("#editor-onboarding button").evaluate((button) => {
+            const replacement = button.cloneNode(true);
+            replacement.textContent = "Continue";
+            button.replaceWith(replacement);
+          });
+        },
+      });
+      assert.equal(result.blocked, true);
+      assert.equal(result.dismissAttempted, false);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reappearing onboarding consumes only one dismiss attempt", async () => {
+    const page = await createCaptionPage(browser, {
+      content: editorOnboardingMarkup({
+        onClick:
+          "window.onboardingClicks += 1; const dialog = this.closest('[role=dialog]'); const replacement = dialog.cloneNode(true); replacement.id = 'editor-onboarding-again'; dialog.replaceWith(replacement)",
+      }),
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.onboardingClicks), 1);
+      assert.equal(await page.locator("#editor-onboarding-again").count(), 1);
+      assert.equal(
+        await page.locator("#description").textContent(),
+        "generated filename"
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("automatic content checks dialog remains untouched", async () => {
+    const page = await createCaptionPage(browser, {
+      content: `
+        <div id="automatic-content-checks" class="test-dialog" role="dialog">
+          <h2>Turn on automatic content checks?</h2>
+          <p>Review content for possible issues before publishing.</p>
+          <button onclick="window.unknownDialogClicks += 1">Cancel</button>
+          <button onclick="window.unknownDialogClicks += 1">Turn on</button>
+        </div>
+      `,
+    });
+    try {
+      await assert.rejects(setCaption(page, caption), /blocked by a visible dialog/i);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+      assert.equal(await page.locator("#automatic-content-checks").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+test("TikTok final publish boundary binds the tracker synchronously before the only click", () => {
   const source = clickPublishOnce.toString();
   const beginClickIndex = source.indexOf("publishResponseTracker.beginClick");
   const finalCollectionIndex = source.indexOf(
@@ -198,18 +856,44 @@ test("TikTok final publish boundary has no setup call after owner validation", (
   const clickIndex = source.indexOf("await finalTarget.handle.click");
 
   assert.ok(beginClickIndex >= 0);
-  assert.ok(beginClickIndex < finalCollectionIndex);
   assert.ok(finalCollectionIndex < finalBoundaryIndex);
   assert.ok(finalBoundaryIndex < finalBoundaryEndIndex);
   assert.ok(finalBoundaryEndIndex < consumeIndex);
-  assert.ok(consumeIndex < clickIndex);
+  assert.ok(consumeIndex < beginClickIndex);
+  assert.ok(beginClickIndex < clickIndex);
   assert.doesNotMatch(
     source.slice(finalBoundaryEndIndex, consumeIndex),
     /\bawait\b|waitFor|scroll|locator\(|beginClick|beforeClick|beforeFinalValidation/
   );
-  assert.match(
+  assert.doesNotMatch(
     source.slice(consumeIndex, clickIndex),
-    /^actionGuard\.consume\(\);\s*$/
+    /\bawait\b|waitFor|scroll|locator\(/
+  );
+});
+
+test("TikTok final publish boundary resolves the operation binding immediately before the one-shot guard", () => {
+  const source = clickPublishOnce.toString();
+  const finalBoundaryIndex = source.indexOf(
+    "const finalBoundaryInfo = await getPublishCandidateInfo"
+  );
+  const bindingResolutionIndex = source.indexOf(
+    "resolveFinalPublishOperationBinding",
+    finalBoundaryIndex
+  );
+  const trackerArmIndex = source.indexOf(
+    "publishResponseTracker.arm",
+    bindingResolutionIndex
+  );
+  const consumeIndex = source.indexOf("actionGuard.consume()");
+
+  assert.ok(finalBoundaryIndex >= 0);
+  assert.ok(bindingResolutionIndex > finalBoundaryIndex);
+  assert.ok(trackerArmIndex > bindingResolutionIndex);
+  assert.ok(trackerArmIndex < consumeIndex);
+  assert.ok(bindingResolutionIndex < consumeIndex);
+  assert.doesNotMatch(
+    source.slice(bindingResolutionIndex, consumeIndex),
+    /\bawait\b|waitFor|scroll|locator\(/
   );
 });
 
@@ -222,6 +906,31 @@ test("TikTok publish path contains no automatic overlay interaction", () => {
     uploadSource,
     /addDefaultSound\(|disableShortContentCheck\(/
   );
+});
+
+test("TikTok production upload captures the operation binding before file assignment", () => {
+  const source = uploadVideo.toString();
+  const assignmentSource = setVideoFile.toString();
+  const trackerIndex = source.indexOf("createPrePublishOperationBindingTracker");
+  const fileIndex = source.indexOf("setVideoFile");
+  const resolverIndex = source.indexOf("resolveExpectedOperationBinding");
+  const callbackIndex = assignmentSource.indexOf("beforeAssignment();");
+  const assignmentIndex = assignmentSource.indexOf("fileInput.setInputFiles");
+
+  assert.ok(trackerIndex >= 0);
+  assert.ok(trackerIndex < fileIndex);
+  assert.ok(fileIndex < resolverIndex);
+  assert.match(
+    source,
+    /setVideoFile[\s\S]+beforeAssignment:\s*\(\)\s*=>\s*operationBindingTracker\.arm\(\)/
+  );
+  assert.ok(callbackIndex >= 0);
+  assert.ok(callbackIndex < assignmentIndex);
+  assert.doesNotMatch(
+    assignmentSource.slice(callbackIndex, assignmentIndex),
+    /\bawait\b/
+  );
+  assert.match(source, /operationBindingTracker\.dispose\(\)/);
 });
 
 function createResponseTracker({ success = false, failure = null } = {}) {
@@ -251,29 +960,747 @@ function createResponseTracker({ success = false, failure = null } = {}) {
   };
 }
 
+const EXPECTED_PUBLISH_OPERATION_BINDING = Object.freeze({
+  kind: "project",
+  value: "current-project",
+});
+
+const EXPECTED_VIDEO_OPERATION_BINDING = Object.freeze({
+  kind: "video",
+  value: "current-video",
+});
+
+function createPrePublishBindingHarness({
+  method = "POST",
+  requestUrl =
+    "https://www.tiktok.com/tiktok/v1/creator/content/check/create/",
+  resourceType = "xhr",
+  navigation = false,
+  videoId = "current-video",
+  frameMatches = true,
+} = {}) {
+  const page = new EventEmitter();
+  const mainFrame = {};
+  const otherFrame = {};
+  page.url = () => "https://www.tiktok.com/tiktokstudio/upload";
+  page.mainFrame = () => mainFrame;
+  const requestPayload = videoId === null ? {} : { video_id: videoId };
+  const request = {
+    frame: () => (frameMatches ? mainFrame : otherFrame),
+    isNavigationRequest: () => navigation,
+    method: () => method,
+    postData: () => JSON.stringify(requestPayload),
+    postDataJSON: () => requestPayload,
+    resourceType: () => resourceType,
+    url: () => requestUrl,
+  };
+  return { page, request };
+}
+
+test("TikTok pre-publish tracker captures one stable current-video binding", () => {
+  const { page, request } = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    page.emit("request", request);
+
+    assert.deepEqual(tracker.resolve(), {
+      ok: true,
+      binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      matchingRequestCount: 2,
+    });
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker rejects missing and ambiguous video bindings", () => {
+  const missing = createPrePublishBindingHarness({
+    videoId: null,
+  });
+  const missingTracker = createPrePublishOperationBindingTracker(missing.page);
+  try {
+    missingTracker.arm();
+    missing.page.emit("request", missing.request);
+    assert.equal(missingTracker.resolve().ok, false);
+  } finally {
+    missingTracker.dispose();
+  }
+
+  const first = createPrePublishBindingHarness({
+    videoId: "first-video",
+  });
+  const secondPayload = { video_id: "second-video" };
+  const secondRequest = {
+    ...first.request,
+    postData: () => JSON.stringify(secondPayload),
+    postDataJSON: () => secondPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(first.page);
+  try {
+    tracker.arm();
+    first.page.emit("request", first.request);
+    first.page.emit("request", secondRequest);
+    const ambiguous = tracker.resolve();
+    assert.equal(ambiguous.ok, false);
+    assert.equal(ambiguous.reasonCode, "ambiguous-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker ignores untrusted transport lookalikes", () => {
+  const trusted = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(trusted.page);
+  try {
+    tracker.arm();
+    for (const options of [
+      { requestUrl: "https://example.com/tiktok/v1/creator/content/check/create/" },
+      { requestUrl: "https://www.tiktok.com/tiktok/v1/creator/content/check/status/" },
+      { method: "GET" },
+      { resourceType: "document" },
+      { navigation: true },
+      { frameMatches: false },
+    ]) {
+      trusted.page.emit(
+        "request",
+        createPrePublishBindingHarness(options).request
+      );
+    }
+
+    const resolution = tracker.resolve();
+    assert.equal(resolution.ok, false);
+    assert.equal(resolution.reasonCode, "binding-not-observed");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok pre-publish tracker rejects conflicting query and body video IDs", () => {
+  const { page, request } = createPrePublishBindingHarness({
+    requestUrl:
+      "https://www.tiktok.com/tiktok/v1/creator/content/check/create/?video_id=query-video",
+    videoId: "body-video",
+  });
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    const resolution = tracker.resolve();
+    assert.equal(resolution.ok, false);
+    assert.equal(resolution.reasonCode, "invalid-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding rejects a video ID introduced after an earlier valid snapshot", () => {
+  const first = createPrePublishBindingHarness({ videoId: "first-video" });
+  const secondPayload = { video_id: "second-video" };
+  const secondRequest = {
+    ...first.request,
+    postData: () => JSON.stringify(secondPayload),
+    postDataJSON: () => secondPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(first.page);
+  try {
+    tracker.arm();
+    first.page.emit("request", first.request);
+    assert.equal(tracker.resolve().ok, true);
+
+    first.page.emit("request", secondRequest);
+    const finalResolution = resolveFinalPublishOperationBinding(
+      null,
+      () => tracker.resolve()
+    );
+    assert.equal(finalResolution.ok, false);
+    assert.equal(finalResolution.reasonCode, "ambiguous-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding rejects a late invalid matching request", () => {
+  const valid = createPrePublishBindingHarness({ videoId: "current-video" });
+  const invalidPayload = {};
+  const invalidRequest = {
+    ...valid.request,
+    postData: () => JSON.stringify(invalidPayload),
+    postDataJSON: () => invalidPayload,
+  };
+  const tracker = createPrePublishOperationBindingTracker(valid.page);
+  try {
+    tracker.arm();
+    valid.page.emit("request", valid.request);
+    assert.equal(tracker.resolve().ok, true);
+
+    valid.page.emit("request", invalidRequest);
+    const finalResolution = resolveFinalPublishOperationBinding(
+      null,
+      () => tracker.resolve()
+    );
+    assert.equal(finalResolution.ok, false);
+    assert.equal(finalResolution.reasonCode, "invalid-video-binding");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding preserves one stable duplicated video ID", () => {
+  const { page, request } = createPrePublishBindingHarness();
+  const tracker = createPrePublishOperationBindingTracker(page);
+  try {
+    tracker.arm();
+    page.emit("request", request);
+    page.emit("request", request);
+
+    assert.deepEqual(
+      resolveFinalPublishOperationBinding(null, () => tracker.resolve()),
+      {
+        ok: true,
+        binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      }
+    );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok final operation binding preserves the static fallback and rejects resolver failures", () => {
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(
+      EXPECTED_VIDEO_OPERATION_BINDING,
+      null
+    ),
+    {
+      ok: true,
+      binding: EXPECTED_VIDEO_OPERATION_BINDING,
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => ({
+      ok: false,
+      reasonCode: "binding-not-observed",
+    })),
+    {
+      ok: false,
+      reasonCode: "binding-not-observed",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => {
+      throw new Error("fixture resolver failure");
+    }),
+    {
+      ok: false,
+      reasonCode: "binding-resolution-failed",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () =>
+      Promise.resolve({
+        ok: true,
+        binding: EXPECTED_VIDEO_OPERATION_BINDING,
+      })
+    ),
+    {
+      ok: false,
+      reasonCode: "async-binding-resolution-rejected",
+    }
+  );
+  assert.deepEqual(
+    resolveFinalPublishOperationBinding(null, () => ({
+      ok: true,
+      binding: { kind: "video", value: "invalid binding value" },
+    })),
+    {
+      ok: false,
+      reasonCode: "invalid-operation-binding",
+    }
+  );
+});
+
+function createPublishResponseHarness({
+  payload = {
+    code: 0,
+    data: {
+      project_id: "current-project",
+      post_id: "7420000000000000001",
+    },
+  },
+  requestUrl =
+    "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=secret",
+  requestPayload = {
+    project_id: "current-project",
+    caption: "fixture caption",
+  },
+} = {}) {
+  const page = new EventEmitter();
+  page.url = () => "https://www.tiktok.com/tiktokstudio/upload";
+  const request = {
+    method: () => "POST",
+    postData: () => JSON.stringify(requestPayload),
+    postDataJSON: () => requestPayload,
+    url: () => requestUrl,
+  };
+  const response = {
+    json: async () => payload,
+    request: () => request,
+    status: () => 200,
+    url: () => requestUrl,
+  };
+  return { page, request, response };
+}
+
+test("TikTok publish response becomes authoritative only for the bound operation", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), true);
+    assert.equal(evidence.currentVideoMatched, true);
+    assert.equal(evidence.expectedCaptionMatched, true);
+    assert.equal(evidence.operationBindingMatched, true);
+    assert.equal(evidence.operationBindingKind, "project");
+    assert.equal(evidence.operationId, "operation-fixture");
+    assert.equal(evidence.postId, "7420000000000000001");
+    assert.equal(
+      evidence.url,
+      "https://www.tiktok.com/tiktok/web/project/post/v1/"
+    );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response binds through its exact request when the body does not echo the video ID", async () => {
+  const { page, request, response } = createPublishResponseHarness({
+    payload: {
+      code: 0,
+      data: {
+        post_id: "7420000000000000001",
+      },
+    },
+    requestPayload: {
+      video_id: "current-video",
+      caption: "fixture caption",
+    },
+  });
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_VIDEO_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), true);
+    assert.equal(evidence.operationBindingKind, "video");
+    assert.equal(evidence.operationBindingSource, "request-response-identity");
+    assert.equal(evidence.postId, "7420000000000000001");
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without the active composer proof", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: false,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(evidence.currentVideoMatched, false);
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound when the request caption differs", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "different caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without a pre-established operation binding", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({ expectedCaption: "fixture caption" });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound without one valid returned post ID", async () => {
+  for (const payload of [
+    { code: 0, data: { project_id: "current-project" } },
+    { code: 1001, data: { post_id: "7420000000000000001" } },
+    {
+      code: 0,
+      data: {
+        project_id: "current-project",
+        success: false,
+        status_code: 1001,
+        post_id: "7420000000000000001",
+      },
+    },
+    {
+      data: {
+        project_id: "current-project",
+        post_id: "7420000000000000001",
+      },
+    },
+    { code: 0, data: { post_id: "not-a-post-id" } },
+    {
+      code: 0,
+      data: {
+        post_id: "7420000000000000001",
+        item_id: "7420000000000000002",
+      },
+    },
+  ]) {
+    const { page, request, response } = createPublishResponseHarness({
+      payload,
+    });
+    const tracker = createPublishResponseTracker(page);
+    try {
+      tracker.arm({
+        expectedCaption: "fixture caption",
+        expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+      });
+      tracker.beginClick("operation-fixture", {
+        activeComposerMatched: true,
+      });
+      page.emit("request", request);
+      page.emit("response", response);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        isAuthoritativePublishEvidence(tracker.success()),
+        false,
+        JSON.stringify(payload)
+      );
+    } finally {
+      tracker.dispose();
+    }
+  }
+});
+
+test("TikTok publish request observed before the click boundary is ignored", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    page.emit("request", request);
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(tracker.success(), null);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound when request and response operation IDs differ", async () => {
+  const { page, request, response } = createPublishResponseHarness({
+    payload: {
+      code: 0,
+      data: {
+        project_id: "different-project",
+        post_id: "7420000000000000001",
+      },
+    },
+  });
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok publish response remains unbound after multiple candidate requests", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  const secondRequestPayload = {
+    project_id: "other-project",
+    caption: "fixture caption",
+  };
+  const secondRequest = {
+    method: () => "POST",
+    postData: () => JSON.stringify(secondRequestPayload),
+    postDataJSON: () => secondRequestPayload,
+    url: () =>
+      "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=other",
+  };
+  const secondResponse = {
+    json: async () => ({
+      code: 0,
+      data: {
+        project_id: "other-project",
+        post_id: "7420000000000000002",
+      },
+    }),
+    request: () => secondRequest,
+    status: () => 200,
+    url: () => secondRequest.url(),
+  };
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("request", secondRequest);
+    page.emit("response", response);
+    page.emit("response", secondResponse);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+const SAFE_MUSIC_CHECK_STATUS = "No issues found.";
+const SAFE_CONTENT_CHECK_STATUS =
+  "No issues found. However, your video could still be removed later if it violates our Community Guidelines.";
+
+function studioChecksMarkup({
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
+  uploadPending = false,
+} = {}) {
+  return `
+    <div class="card checks-card">
+      ${
+        uploadPending
+          ? '<div class="upload-check-gate">Checks can only start after the file is uploaded.</div>'
+          : ""
+      }
+      <div class="checks-sections">
+        <div class="copyright-check">
+          <div data-e2e="copyright_container">Music copyright check</div>
+          <div class="check-status">${musicCheckStatus}</div>
+        </div>
+        <div class="content-check">
+          <div class="headline-wrapper">Content check lite</div>
+          <div class="check-status">${contentCheckStatus}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+const CONTINUE_TO_POST_TITLE = "Continue to post?";
+const CONTINUE_TO_POST_BODY_ONE =
+  "The copyright check is incomplete. Posting your video now will stop the check.";
+const CONTINUE_TO_POST_BODY_TWO =
+  "We're still checking your video for potential issues. Do you want to continue posting before the check is complete?";
+
+async function installContinueToPostDialog(page, {
+  afterPrimary = false,
+  bodyOne = CONTINUE_TO_POST_BODY_ONE,
+  bodyTwo = CONTINUE_TO_POST_BODY_TWO,
+  externalDecoy = false,
+  extraPostNow = false,
+  postNowLabel = "Post now",
+  replaceAfterOpen = false,
+  replacePostNowAfterOpen = false,
+  secondDialog = false,
+  secondaryConfirmClicks = 0,
+  title = CONTINUE_TO_POST_TITLE,
+} = {}) {
+  await page.evaluate(
+    (options) => {
+      window.secondaryConfirmClicks = options.secondaryConfirmClicks;
+      window.secondaryCancelClicks = 0;
+      window.secondaryDecoyClicks = 0;
+      const createDialog = (id) => {
+        const dialog = document.createElement("div");
+        dialog.id = id;
+        dialog.className = "transaction-dialog";
+        dialog.setAttribute("role", "dialog");
+        dialog.setAttribute("aria-modal", "true");
+        dialog.style.cssText =
+          "position:fixed;left:430px;top:200px;width:540px;height:268px;z-index:50";
+        dialog.innerHTML =
+          `<h2>${options.title}</h2>` +
+          `<p>${options.bodyOne}</p>` +
+          `<p>${options.bodyTwo}</p>` +
+          '<button type="button" onclick="window.secondaryCancelClicks += 1">Cancel</button>' +
+          `<button type="button" onclick="window.secondaryConfirmClicks += 1">${options.postNowLabel}</button>` +
+          (options.extraPostNow
+            ? '<button type="button" onclick="window.secondaryConfirmClicks += 100">Post now</button>'
+            : "");
+        document.body.appendChild(dialog);
+        return dialog;
+      };
+      const open = () => {
+        const dialog = createDialog("continue-to-post-dialog");
+        if (options.secondDialog) {
+          createDialog("continue-to-post-dialog-two");
+        }
+        if (options.replaceAfterOpen) {
+          setTimeout(() => {
+            const replacement = dialog.cloneNode(true);
+            replacement.id = "continue-to-post-dialog-replacement";
+            dialog.replaceWith(replacement);
+          }, 5);
+        }
+        if (options.replacePostNowAfterOpen) {
+          setTimeout(() => {
+            const original = Array.from(dialog.querySelectorAll("button")).find(
+              (button) => button.textContent === options.postNowLabel
+            );
+            const replacement = original.cloneNode(true);
+            replacement.id = "replacement-post-now";
+            original.replaceWith(replacement);
+          }, 5);
+        }
+      };
+      if (options.externalDecoy) {
+        const decoy = document.createElement("button");
+        decoy.id = "external-post-now-decoy";
+        decoy.textContent = "Post now";
+        decoy.addEventListener("click", () => {
+          window.secondaryDecoyClicks += 1;
+        });
+        document.body.appendChild(decoy);
+      }
+      if (options.afterPrimary) {
+        document.querySelector("#publish").addEventListener("click", open);
+      } else {
+        open();
+      }
+    },
+    {
+      afterPrimary,
+      bodyOne,
+      bodyTwo,
+      externalDecoy,
+      extraPostNow,
+      postNowLabel,
+      replaceAfterOpen,
+      replacePostNowAfterOpen,
+      secondDialog,
+      secondaryConfirmClicks,
+      title,
+    }
+  );
+}
+
 async function createPublishPage(browser, {
   bodyText = "",
   bindToComposer = true,
   buttonLabel = "Post",
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
   includeButton = true,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
   secondButton = false,
   onClick = "window.publishClickCount += 1",
   statusAttributes = 'role="status"',
+  uploadPending = false,
 } = {}) {
   const page = await browser.newPage({
     viewport: { width: 1200, height: 900 },
   });
   const button = includeButton
-    ? `<button type="button" id="publish" class="publish-button" onclick="${onClick}">${buttonLabel}</button>`
+    ? `<button
+         type="button"
+         role="button"
+         id="publish"
+         class="publish-button"
+         data-icon-only="false"
+         data-size="large"
+         data-disabled="false"
+         data-e2e="post_video_button"
+         onclick="${onClick}"
+       >${buttonLabel}</button>`
     : "";
   const duplicate = secondButton
-    ? '<button type="button" id="publish-two" class="publish-button">Publish</button>'
+    ? '<button type="button" role="button" id="publish-two" class="publish-button" data-icon-only="false" data-size="large" data-disabled="false" data-e2e="post_video_button">Publish</button>'
     : "";
   const uploadForm = bindToComposer
     ? `<form id="upload-composer">
         <input id="upload-input" type="file" accept="video/*">
-        ${button}
-        ${duplicate}
+        <div class="footer">
+          <div class="button-group">
+            ${button}
+            ${duplicate}
+            <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+          </div>
+        </div>
       </form>`
     : `<form id="upload-composer">
         <input id="upload-input" type="file" accept="video/*">
@@ -295,6 +1722,7 @@ async function createPublishPage(browser, {
       #publish-two { right: 210px; }
     </style>
     <div id="status" ${statusAttributes}>${bodyText}</div>
+    ${studioChecksMarkup({ contentCheckStatus, musicCheckStatus, uploadPending })}
     ${uploadForm}
     <script>window.publishClickCount = 0;</script>
   `;
@@ -310,6 +1738,108 @@ async function createPublishPage(browser, {
   return page;
 }
 
+async function createHydratedStudioPublishPage(browser, {
+  contentCheckStatus = SAFE_CONTENT_CHECK_STATUS,
+  includeDiscard = true,
+  musicCheckStatus = SAFE_MUSIC_CHECK_STATUS,
+  nestedScrollContainer = false,
+  onClick = "window.publishClickCount += 1",
+  pathName = "/tiktokstudio/upload",
+  uploadPending = false,
+} = {}) {
+  const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
+  const document = `
+    <style>
+      ${
+        nestedScrollContainer
+          ? `html, body { height: 1000px; margin: 0; overflow: hidden; }
+             .main-body { height: 932px; left: 0; overflow: auto; position: absolute; top: 68px; width: 1400px; }
+             .layout { height: 1538px; position: relative; }
+             .button-group { position: absolute; top: 1420px; left: 280px; }`
+          : `body { min-height: 1600px; }
+             .button-group { position: absolute; top: 1488px; left: 280px; }`
+      }
+      [data-e2e="post_video_button"] { height: 36px; width: 200px; }
+    </style>
+    <div id="studio-sidebar" data-tt="Sidebar_Sidebar_Clickable">
+      <button type="button">Posts</button>
+    </div>
+    <div class="main-body">
+      <div class="layout">
+        ${studioChecksMarkup({
+          contentCheckStatus,
+          musicCheckStatus,
+          uploadPending,
+        })}
+        <div class="footer">
+          <div class="button-group">
+            <button
+              type="button"
+              role="button"
+              class="Button__root Button__root--size-large Button__root--type-primary"
+              data-icon-only="false"
+              data-size="large"
+              data-disabled="false"
+              data-e2e="post_video_button"
+              onclick="${onClick}"
+            ><span>Post</span></button>
+            ${
+              includeDiscard
+                ? '<button type="button" role="button" data-e2e="discard_post_button">Discard</button>'
+                : ""
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>window.publishClickCount = 0;</script>
+  `;
+  await page.route("https://www.tiktok.com/**", (route) =>
+    route.fulfill({ contentType: "text/html", body: document })
+  );
+  await page.goto(`https://www.tiktok.com${pathName}`);
+  return page;
+}
+
+async function installPostTargetScrollProbe(page, behavior) {
+  const baseHandle = await page.locator("button").first().elementHandle();
+  const handlePrototype = Object.getPrototypeOf(baseHandle);
+  await baseHandle.dispose();
+  const originalScrollIntoViewIfNeeded =
+    handlePrototype.scrollIntoViewIfNeeded;
+  let calls = 0;
+  const scrolledIds = [];
+
+  handlePrototype.scrollIntoViewIfNeeded = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    if (!isPostTarget) {
+      return originalScrollIntoViewIfNeeded.apply(this, args);
+    }
+
+    calls += 1;
+    scrolledIds.push((await this.getAttribute("id").catch(() => "")) || "");
+    const proceed = () => originalScrollIntoViewIfNeeded.apply(this, args);
+    return behavior
+      ? behavior({ callCount: calls, handle: this, proceed })
+      : proceed();
+  };
+
+  return {
+    get calls() {
+      return calls;
+    },
+    get scrolledIds() {
+      return [...scrolledIds];
+    },
+    restore() {
+      handlePrototype.scrollIntoViewIfNeeded =
+        originalScrollIntoViewIfNeeded;
+    },
+  };
+}
+
 function fastPublishOptions(overrides = {}) {
   return {
     findMaxPolls: 1,
@@ -317,6 +1847,9 @@ function fastPublishOptions(overrides = {}) {
     settleMs: 0,
     confirmationMaxPolls: 3,
     confirmationPollIntervalMs: 10,
+    readinessMaxWaitMs: 20,
+    readinessPollIntervalMs: 1,
+    readinessStablePolls: 1,
     ...overrides,
   };
 }
@@ -339,6 +1872,1933 @@ test("TikTok final publish rejects composite transactional actions", async (t) =
   } finally {
     await page.close();
   }
+});
+
+test("TikTok qualifies the hydrated Studio publish action observed in real DOM", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser);
+  try {
+    const diagnostics = await collectPublishCandidateDiagnostics(page);
+    const postCandidate = diagnostics.candidates.find(
+      ({ dataE2e }) => dataE2e === "post_video_button"
+    );
+    assert.equal(postCandidate.status, "ACCEPTED");
+    assert.equal(postCandidate.structuralBinding, "verified-upload-action-region");
+    assert.equal(diagnostics.qualifiedTargetCount, 1);
+
+    const result = await clickPublishOnce(page, {
+      maxPolls: 1,
+      pollIntervalMs: 0,
+      settleMs: 0,
+    });
+    assert.equal(result.outcome, "clicked");
+    assert.equal(result.clickAttempted, true);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+  } finally {
+    await page.close();
+  }
+});
+
+test("TikTok reveals the exact final Studio action before visibility-filtered qualification", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser, {
+    nestedScrollContainer: true,
+  });
+  const post = page.locator('[data-e2e="post_video_button"]');
+  const locatorPrototype = Object.getPrototypeOf(post);
+  const postHandle = await post.elementHandle();
+  const handlePrototype = Object.getPrototypeOf(postHandle);
+  await postHandle.dispose();
+  const originalIsVisible = locatorPrototype.isVisible;
+  const originalScrollIntoViewIfNeeded =
+    handlePrototype.scrollIntoViewIfNeeded;
+  let preparationScrolls = 0;
+
+  locatorPrototype.isVisible = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    const preparationComplete = await page
+      .evaluate(() => window.preparationScrollComplete === true)
+      .catch(() => false);
+    if (isPostTarget && !preparationComplete) {
+      return false;
+    }
+    return originalIsVisible.apply(this, args);
+  };
+  handlePrototype.scrollIntoViewIfNeeded = async function (...args) {
+    const isPostTarget =
+      (await this.getAttribute("data-e2e").catch(() => "")) ===
+      "post_video_button";
+    if (isPostTarget) {
+      preparationScrolls += 1;
+    }
+    const result = await originalScrollIntoViewIfNeeded.apply(this, args);
+    if (isPostTarget) {
+      await this.evaluate(() => {
+        window.preparationScrollComplete = true;
+      });
+    }
+    return result;
+  };
+
+  try {
+    const before = await post.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const container = document.querySelector(".main-body");
+      return {
+        bodyScrollable:
+          document.documentElement.scrollHeight > window.innerHeight ||
+          document.body.scrollHeight > window.innerHeight,
+        intersectsViewport: rect.bottom > 0 && rect.top < window.innerHeight,
+        scrollableDelta: container.scrollHeight - container.clientHeight,
+        scrollTop: container.scrollTop,
+        top: rect.top,
+      };
+    });
+    assert.deepEqual(before, {
+      bodyScrollable: false,
+      intersectsViewport: false,
+      scrollableDelta: 606,
+      scrollTop: 0,
+      top: 1488,
+    });
+
+    const result = await clickPublishOnce(page, {
+      maxPolls: 1,
+      pollIntervalMs: 0,
+      settleMs: 0,
+    });
+    const after = await post.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const container = document.querySelector(".main-body");
+      return {
+        intersectsViewport: rect.bottom > 0 && rect.top < window.innerHeight,
+        scrollTop: container.scrollTop,
+      };
+    });
+
+    assert.equal(result.outcome, "clicked");
+    assert.equal(result.clickAttempted, true);
+    assert.equal(preparationScrolls, 1);
+    assert.deepEqual(after, {
+      intersectsViewport: true,
+      scrollTop: 606,
+    });
+    assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+  } finally {
+    locatorPrototype.isVisible = originalIsVisible;
+    handlePrototype.scrollIntoViewIfNeeded = originalScrollIntoViewIfNeeded;
+    await page.close();
+  }
+});
+
+test("TikTok final action preparation remains exact and fail closed", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const clickOptions = { maxPolls: 1, pollIntervalMs: 0, settleMs: 0 };
+
+  async function assertZeroClickFailure(page, probe) {
+    const result = await clickPublishOnce(page, clickOptions);
+    assert.equal(result.outcome, "failure");
+    assert.equal(result.retryAllowed, true);
+    assert.equal(result.clickAttempted, false);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    if (probe) {
+      assert.equal(probe.calls, 0);
+    }
+    return result;
+  }
+
+  await t.test("missing structural target receives zero scroll and zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.remove());
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two physical verified targets receive zero ambiguous scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const original = document.querySelector(".button-group");
+      const duplicate = original.cloneNode(true);
+      duplicate.id = "second-preparation-action-group";
+      duplicate.style.left = "520px";
+      original.parentElement.appendChild(duplicate);
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("sidebar Post decoy is never used for preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      document.querySelector('[data-e2e="post_video_button"]').id =
+        "real-studio-post";
+      const sidebar = document.querySelector("#studio-sidebar");
+      sidebar.setAttribute("role", "navigation");
+      sidebar.insertAdjacentHTML(
+        "beforeend",
+        `<div class="footer"><div class="button-group">
+          <button id="sidebar-post-decoy" type="button" role="button"
+            data-icon-only="false" data-size="large" data-disabled="false"
+            data-e2e="post_video_button">Post</button>
+          <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+        </div></div>`
+      );
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "clicked", JSON.stringify(result));
+      assert.equal(result.clickAttempted, true);
+      assert.equal(probe.calls, 1);
+      assert.deepEqual(probe.scrolledIds, ["real-studio-post"]);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("dialog Post target is never used for preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "alertdialog");
+      dialog.style.cssText =
+        "position:fixed;left:400px;top:100px;width:320px;height:200px";
+      dialog.innerHTML = `<div class="footer"><div class="button-group">
+        <button id="dialog-post-decoy" type="button" role="button"
+          data-icon-only="false" data-size="large" data-disabled="false"
+          data-e2e="post_video_button">Post</button>
+        <button type="button" role="button" data-e2e="discard_post_button">Discard</button>
+      </div></div>`;
+      document.body.appendChild(dialog);
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("missing paired Discard fails before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      includeDiscard: false,
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two paired Discard controls fail before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page.evaluate(() => {
+      const discard = document.querySelector(
+        '[data-e2e="discard_post_button"]'
+      );
+      discard.parentElement.appendChild(discard.cloneNode(true));
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("data-disabled true fails before scroll", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.setAttribute("data-disabled", "true"));
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await assertZeroClickFailure(page, probe);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("replacement after scroll is rediscovered and requalified", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    await page
+      .locator('[data-e2e="post_video_button"]')
+      .evaluate((target) => target.setAttribute("id", "preparation-owner"));
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((original) => {
+          const replacement = original.cloneNode(true);
+          replacement.id = "replacement-after-preparation";
+          original.replaceWith(replacement);
+        });
+      }
+    );
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "clicked");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(probe.calls, 1);
+      assert.equal(await page.locator("#preparation-owner").count(), 0);
+      assert.equal(
+        await page.locator("#replacement-after-preparation").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("target disappearing after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((target) => target.remove());
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /could not find exactly one/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("two targets appearing after scroll receive zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ handle, proceed }) => {
+        await proceed();
+        await handle.evaluate((target) => {
+          const original = target.closest(".button-group");
+          const duplicate = original.cloneNode(true);
+          duplicate.id = "late-second-action-group";
+          duplicate.style.left = "520px";
+          original.parentElement.appendChild(duplicate);
+        });
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /multiple distinct active/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("readiness reverting to pending after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ proceed }) => {
+        await proceed();
+        await page.locator(".content-check .check-status").evaluate(
+          (status) => {
+            status.textContent =
+              "Checking in progress. This will take about 10 minutes. Longer videos may take more time.";
+          }
+        );
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /readiness changed immediately before click/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("dialog appearing after scroll receives zero click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(
+      page,
+      async ({ proceed }) => {
+        await proceed();
+        await page.evaluate(() => {
+          const dialog = document.createElement("div");
+          dialog.id = "late-preparation-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:400px;top:100px;width:320px;height:200px";
+          dialog.textContent = "Unexpected dialog";
+          document.body.appendChild(dialog);
+        });
+      }
+    );
+    try {
+      const result = await assertZeroClickFailure(page);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("scroll failure is retryable only before any click", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const probe = await installPostTargetScrollProbe(page, async () => {
+      throw new Error("fixture scroll failure");
+    });
+    try {
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.retryAllowed, true);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(probe.calls, 1);
+      assert.match(result.reason, /fixture scroll failure/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("production preparation has no alternate action sink", () => {
+    const source = `${prepareTikTokPublishTargetForQualification.toString()} ${clickPublishOnce.toString()}`;
+    assert.equal((source.match(/\.click\s*\(/g) || []).length, 1);
+    assert.doesNotMatch(
+      source,
+      /force\s*:\s*true|mouse\.|Post now|Continue to post|\bCancel\b|window\.scrollTo|css-86gjln|edss2sz6/
+    );
+    assert.match(
+      source,
+      /actionGuard\.consume\(\);[\s\S]*publishResponseTracker\.beginClick[\s\S]*await finalTarget\.handle\.click/
+    );
+  });
+});
+
+test("TikTok post-scroll target resolution diagnostics are exact and read only", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const diagnosticPrefix =
+    "TikTok publish target resolution diagnostics: ";
+
+  async function withPostVisibilityOverride(page, visible, run) {
+    const locatorPrototype = Object.getPrototypeOf(
+      page.locator('[data-e2e="post_video_button"]')
+    );
+    const originalIsVisible = locatorPrototype.isVisible;
+    locatorPrototype.isVisible = async function (...args) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      return isPostTarget
+        ? visible
+        : originalIsVisible.apply(this, args);
+    };
+    try {
+      return await run();
+    } finally {
+      locatorPrototype.isVisible = originalIsVisible;
+    }
+  }
+
+  async function installActiveUploadForm(page) {
+    await page.evaluate(() => {
+      const layout = document.querySelector(".layout");
+      const form = document.createElement("form");
+      const input = document.createElement("input");
+      const transfer = new DataTransfer();
+      transfer.items.add(
+        new File(["fixture"], "fixture.mp4", { type: "video/mp4" })
+      );
+      input.type = "file";
+      input.files = transfer.files;
+      layout.before(form);
+      form.append(input, layout);
+    });
+  }
+
+  async function captureResolutionLogs(run) {
+    const originalConsoleLog = console.log;
+    const logs = [];
+    console.log = (...args) => logs.push(args.map(String).join(" "));
+    try {
+      return { result: await run(), logs };
+    } finally {
+      console.log = originalConsoleLog;
+    }
+  }
+
+  await t.test("separates Playwright visibility from DOM info visibility", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const diagnostics = await withPostVisibilityOverride(
+        page,
+        false,
+        () => collectTikTokPublishTargetResolutionDiagnostics(page)
+      );
+      assert.equal(diagnostics.directPostCount, 1);
+      assert.equal(diagnostics.targets.length, 1);
+      assert.equal(diagnostics.targets[0].playwrightVisible, false);
+      assert.equal(diagnostics.targets[0].infoVisible, true);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.qualified,
+        true
+      );
+      assert.equal(diagnostics.targets[0].reachedFinalTargets, false);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reports an absent direct Studio selector", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => target.remove());
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.directPostCount, 0);
+      assert.equal(diagnostics.targets.length, 0);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("reports when the canonical owner cannot be obtained", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const locatorPrototype = Object.getPrototypeOf(page.locator("button"));
+    const originalEvaluateHandle = locatorPrototype.evaluateHandle;
+    locatorPrototype.evaluateHandle = async function (...args) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      if (isPostTarget) {
+        throw new Error("fixture canonical owner unavailable");
+      }
+      return originalEvaluateHandle.apply(this, args);
+    };
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].canonicalOwnerObtained, false);
+      assert.equal(diagnostics.targets[0].candidateInfoAvailable, false);
+      assert.deepEqual(diagnostics.targets[0].classification.reasons, [
+        "candidate-info-unavailable",
+      ]);
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      locatorPrototype.evaluateHandle = originalEvaluateHandle;
+      await page.close();
+    }
+  });
+
+  await t.test("reports candidate info collection failure separately", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const sampleHandle = await page.locator("button").first().elementHandle();
+    const handlePrototype = Object.getPrototypeOf(sampleHandle);
+    await sampleHandle.dispose();
+    const originalEvaluate = handlePrototype.evaluate;
+    handlePrototype.evaluate = async function (callback, argument, ...rest) {
+      const isPostTarget =
+        (await this.getAttribute("data-e2e").catch(() => "")) ===
+        "post_video_button";
+      if (
+        isPostTarget &&
+        argument &&
+        Object.prototype.hasOwnProperty.call(argument, "inspectFinalBoundary")
+      ) {
+        throw new Error("fixture candidate info unavailable");
+      }
+      return originalEvaluate.call(this, callback, argument, ...rest);
+    };
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].canonicalOwnerObtained, true);
+      assert.equal(diagnostics.targets[0].candidateInfoAvailable, false);
+      assert.match(
+        diagnostics.targets[0].candidateInfoError,
+        /fixture candidate info unavailable/
+      );
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      handlePrototype.evaluate = originalEvaluate;
+      await page.close();
+    }
+  });
+
+  await t.test("preserves the candidate classifier rejection reason", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => {
+          target.textContent = "Schedule";
+        });
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, false);
+      assert.deepEqual(diagnostics.targets[0].classification.reasons, [
+        "label-not-allowlisted",
+      ]);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-candidate-qualification-failed"
+      );
+      assert.equal(diagnostics.finalTargetCount, 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("preserves the stricter preparation classifier reason", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await installActiveUploadForm(page);
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) => target.setAttribute("data-size", "small"));
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.qualified,
+        false
+      );
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-button-attributes-mismatch"
+      );
+      assert.equal(diagnostics.targets[0].dataSize, "small");
+      assert.equal(diagnostics.finalTargetCount, 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("captures attributes changed after successful preparation", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const preparation =
+        await prepareTikTokPublishTargetForQualification(page);
+      assert.equal(preparation.ok, true);
+      await installActiveUploadForm(page);
+      await page
+        .locator('[data-e2e="post_video_button"]')
+        .evaluate((target) =>
+          target.setAttribute("data-disabled", "true")
+        );
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.targets[0].classification.qualified, true);
+      assert.equal(diagnostics.targets[0].dataDisabled, "true");
+      assert.equal(
+        diagnostics.targets[0].preparationClassification.reason,
+        "publish-button-attributes-mismatch"
+      );
+      assert.equal(diagnostics.finalTargetCount, 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("records a fully qualified direct target and locator counts", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      const [target] = diagnostics.targets;
+      assert.equal(diagnostics.directPostCount, 1);
+      assert.equal(diagnostics.publishRoleCount, 1);
+      assert.equal(diagnostics.semanticClickableCount, 3);
+      assert.equal(diagnostics.finalTargetCount, 1);
+      assert.equal(target.canonicalOwnerObtained, true);
+      assert.equal(target.candidateInfoAvailable, true);
+      assert.equal(target.classification.qualified, true);
+      assert.equal(target.preparationClassification.qualified, true);
+      assert.equal(target.normalizedText, "post");
+      assert.equal(target.normalizedAriaLabel, "");
+      assert.equal(target.tagName, "BUTTON");
+      assert.equal(target.role, "button");
+      assert.equal(target.type, "button");
+      assert.equal(target.dataE2e, "post_video_button");
+      assert.equal(target.infoVisible, true);
+      assert.ok(target.rect);
+      assert.equal(target.structuralBinding, "verified-upload-action-region");
+      assert.equal(target.actionRegion.postCount, 1);
+      assert.equal(target.actionRegion.discardCount, 1);
+      assert.equal(target.ancestors.dialog, false);
+      assert.equal(target.pageOrigin, "https://www.tiktok.com");
+      assert.equal(target.pagePath, "/tiktokstudio/upload");
+      assert.equal(target.reachedFinalTargets, true);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("records multiple physical and final qualified targets", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "diagnostic-second-action-group";
+        duplicate.style.left = "520px";
+        original.parentElement.appendChild(duplicate);
+      });
+      const diagnostics =
+        await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(diagnostics.directPostCount, 2);
+      assert.equal(diagnostics.publishRoleCount, 2);
+      assert.equal(diagnostics.finalTargetCount, 2);
+      assert.equal(diagnostics.targets.length, 2);
+      assert.ok(
+        diagnostics.targets.every(
+          (target) =>
+            target.classification.qualified &&
+            target.preparationClassification.qualified &&
+            target.reachedFinalTargets
+        )
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("never clicks or mutates the inspected DOM", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const before = await page.evaluate(() => ({
+        html: document.documentElement.outerHTML,
+        nodes: document.querySelectorAll("*").length,
+      }));
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      const after = await page.evaluate(() => ({
+        html: document.documentElement.outerHTML,
+        nodes: document.querySelectorAll("*").length,
+      }));
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.deepEqual(after, before);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("never invokes target scrolling", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      nestedScrollContainer: true,
+    });
+    const probe = await installPostTargetScrollProbe(page);
+    try {
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(probe.calls, 0);
+    } finally {
+      probe.restore();
+      await page.close();
+    }
+  });
+
+  await t.test("never writes scrollTop", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      nestedScrollContainer: true,
+    });
+    try {
+      await page.evaluate(() => {
+        const container = document.querySelector(".main-body");
+        let currentScrollTop = container.scrollTop;
+        window.diagnosticScrollTopWrites = 0;
+        Object.defineProperty(container, "scrollTop", {
+          configurable: true,
+          get: () => currentScrollTop,
+          set: (value) => {
+            window.diagnosticScrollTopWrites += 1;
+            currentScrollTop = value;
+          },
+        });
+      });
+      await collectTikTokPublishTargetResolutionDiagnostics(page);
+      assert.equal(
+        await page.evaluate(() => window.diagnosticScrollTopWrites),
+        0
+      );
+      const source =
+        collectTikTokPublishTargetResolutionDiagnostics.toString();
+      assert.doesNotMatch(
+        source,
+        /\.click\s*\(|scrollIntoViewIfNeeded|scrollTop\s*=|\.focus\s*\(|\.fill\s*\(|\.press\s*\(|dispatchEvent|setAttribute|replaceWith/
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("none status keeps semantics and clickAttempted false", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const { resolution, click, publish } = await withPostVisibilityOverride(
+        page,
+        false,
+        async () => ({
+          resolution: await captureResolutionLogs(() =>
+            findUniquePublishTarget(page, {
+              maxPolls: 1,
+              pollIntervalMs: 0,
+            })
+          ),
+          click: await captureResolutionLogs(() =>
+            clickPublishOnce(page, {
+              maxPolls: 1,
+              pollIntervalMs: 0,
+              settleMs: 0,
+            })
+          ),
+          publish: await captureResolutionLogs(() =>
+            publishFailClosed(
+              page,
+              createResponseTracker(),
+              fastPublishOptions()
+            )
+          ),
+        })
+      );
+      const expectedReason =
+        "Could not find exactly one enabled TikTok Publish/Post button before any click.";
+      assert.equal(resolution.result.status, "none");
+      assert.equal(resolution.result.count, 0);
+      assert.equal(resolution.result.reason, expectedReason);
+      assert.equal(click.result.outcome, "failure");
+      assert.equal(click.result.retryAllowed, true);
+      assert.equal(click.result.clickAttempted, false);
+      assert.equal(click.result.reason, expectedReason);
+      assert.equal(click.result.diagnostics.directPostCount, 1);
+      assert.equal(click.result.diagnostics.finalTargetCount, 0);
+      assert.equal(publish.result.outcome, "failure");
+      assert.equal(publish.result.retryAllowed, true);
+      assert.equal(publish.result.clickAttempted, false);
+      assert.equal(publish.result.reason, expectedReason);
+      assert.equal(publish.result.diagnostics.directPostCount, 1);
+      assert.equal(publish.result.diagnostics.finalTargetCount, 0);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(
+        resolution.logs.filter((entry) => entry.startsWith(diagnosticPrefix))
+          .length,
+        1
+      );
+      assert.equal(
+        click.logs.filter((entry) => entry.startsWith(diagnosticPrefix)).length,
+        1
+      );
+      assert.equal(
+        publish.logs.filter((entry) => entry.startsWith(diagnosticPrefix))
+          .length,
+        1
+      );
+      assert.doesNotThrow(() =>
+        JSON.parse(
+          click.logs
+            .find((entry) => entry.startsWith(diagnosticPrefix))
+            .slice(diagnosticPrefix.length)
+        )
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("successful resolution does not collect or log diagnostics", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    let resolved;
+    try {
+      const captured = await captureResolutionLogs(() =>
+        findUniquePublishTarget(page, {
+          maxPolls: 1,
+          pollIntervalMs: 0,
+        })
+      );
+      resolved = captured.result;
+      assert.equal(resolved.status, "unique");
+      assert.equal("diagnostics" in resolved, false);
+      assert.equal(
+        captured.logs.some((entry) => entry.startsWith(diagnosticPrefix)),
+        false
+      );
+    } finally {
+      await resolved?.target?.handle?.dispose().catch(() => {});
+      await page.close();
+    }
+  });
+});
+
+test("TikTok refuses a primary publish while the real content check is pending", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await createHydratedStudioPublishPage(browser, {
+    musicCheckStatus: "No issues found.",
+    contentCheckStatus:
+      "Checking in progress. This will take about 10 minutes. Longer videos may take more time.",
+  });
+  try {
+    const result = await publishFailClosed(
+      page,
+      createResponseTracker(),
+      fastPublishOptions()
+    );
+
+    assert.equal(result.outcome, "failure");
+    assert.equal(result.retryAllowed, true);
+    assert.equal(result.clickAttempted, false);
+    assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    assert.match(result.reason, /checks.*pending/i);
+  } finally {
+    await page.close();
+  }
+});
+
+test("TikTok publish readiness is structural, bounded, and revalidated", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const contentPending =
+    "Checking in progress. This will take about 10 minutes. Longer videos may take more time.";
+
+  await t.test("bounded hydration advances from zero anchors to two stable safe polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus:
+        "Checking in progress. This will take about 30 seconds.",
+      contentCheckStatus: contentPending,
+    });
+    const originalWaitForTimeout = page.waitForTimeout;
+    const originalConsoleLog = console.log;
+    const readinessLogs = [];
+    const transitions = [];
+    let waits = 0;
+    console.log = (...args) => readinessLogs.push(args.map(String).join(" "));
+    try {
+      await page.evaluate(() => {
+        document.querySelector('[data-e2e="copyright_container"]').remove();
+        document.querySelector(".headline-wrapper").remove();
+      });
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page.evaluate(() => {
+            const anchor = document.createElement("div");
+            anchor.setAttribute("data-e2e", "copyright_container");
+            anchor.textContent = "Music copyright check";
+            document.querySelector(".copyright-check").prepend(anchor);
+          });
+        } else if (waits === 2) {
+          await page.evaluate(() => {
+            const anchor = document.createElement("div");
+            anchor.className = "headline-wrapper";
+            anchor.textContent = "Content check lite";
+            document.querySelector(".content-check").prepend(anchor);
+          });
+        } else if (waits === 3) {
+          await page.evaluate(
+            ({ contentSafe, musicSafe }) => {
+              document.querySelector(
+                ".copyright-check .check-status"
+              ).textContent = musicSafe;
+              document.querySelector(
+                ".content-check .check-status"
+              ).textContent = contentSafe;
+            },
+            {
+              contentSafe: SAFE_CONTENT_CHECK_STATUS,
+              musicSafe: SAFE_MUSIC_CHECK_STATUS,
+            }
+          );
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+        onTransition: async (transition) => transitions.push(transition),
+      });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.outcome, "ready");
+      assert.equal(result.evidence.phase, "ready");
+      assert.equal(result.evidence.reasonCode, "checks-safe-and-stable");
+      assert.equal(result.evidence.polls, 5);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(
+        readinessLogs.filter((entry) =>
+          entry.startsWith("TikTok publish readiness: ")
+        ).length,
+        4
+      );
+      assert.deepEqual(
+        transitions.map(({ phase }) => phase),
+        [
+          "hydrating-check-structure",
+          "hydrating-check-structure",
+          "waiting-for-checks",
+          "ready",
+        ]
+      );
+      assert.deepEqual(
+        transitions.map(({ polls }) => polls),
+        [1, 2, 3, 4]
+      );
+      assert.equal(transitions.every((transition) => Object.isFrozen(transition)), true);
+      assert.equal(
+        transitions.every(
+          (transition) => !("page" in transition) && !("handle" in transition)
+        ),
+        true
+      );
+      assert.equal(
+        transitions.every(({ clickAttempted }) => clickAttempted === false),
+        true
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      console.log = originalConsoleLog;
+      await page.close();
+    }
+  });
+
+  await t.test("zero anchors remain transient only until the bounded timeout", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        document.querySelector('[data-e2e="copyright_container"]').remove();
+        document.querySelector(".headline-wrapper").remove();
+      });
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+      assert.equal(initial.phase, "hydrating-check-structure");
+      assert.equal(initial.reasonCode, "check-structure-not-materialized");
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(result.evidence.phase, "hydrating-check-structure");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("content-only partial structure is transient and never ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page
+        .locator('[data-e2e="copyright_container"]')
+        .evaluate((anchor) => anchor.remove());
+      const readiness = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(readiness.status, "pending");
+      assert.equal(readiness.phase, "hydrating-check-structure");
+      assert.equal(readiness.evidence.musicState, "missing");
+      assert.equal(readiness.evidence.contentState, "safe");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const partialScenario of [
+    {
+      name: "partial structure with warning text",
+      musicStatus: "Copyright issue found.",
+      status: "warning",
+      reasonCode: "check-warning",
+    },
+    {
+      name: "partial structure with unknown non-empty text",
+      musicStatus: "Analysis queued for later review.",
+      status: "unknown",
+      reasonCode: "unknown-check-status",
+    },
+  ]) {
+    await t.test(`${partialScenario.name} remains terminal`, async () => {
+      const page = await createHydratedStudioPublishPage(browser, {
+        musicCheckStatus: partialScenario.musicStatus,
+      });
+      try {
+        await page
+          .locator(".headline-wrapper")
+          .evaluate((anchor) => anchor.remove());
+        const readiness = classifyTikTokPublishReadinessInfo(
+          await collectTikTokPublishReadinessInfo(page)
+        );
+        assert.equal(readiness.status, partialScenario.status);
+        assert.equal(readiness.reasonCode, partialScenario.reasonCode);
+        assert.notEqual(readiness.phase, "hydrating-check-structure");
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("exact anchors in different regions are terminal ambiguity", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.locator(".content-check").evaluate((section) => {
+        section.parentElement.parentElement.appendChild(section);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(result.evidence.phase, "unknown-terminal");
+      assert.equal(result.evidence.reasonCode, "check-region-mismatch");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const anchorScenario of [
+    {
+      name: "duplicate music anchors",
+      selector: '[data-e2e="copyright_container"]',
+    },
+    {
+      name: "duplicate content anchors",
+      selector: ".headline-wrapper",
+    },
+  ]) {
+    await t.test(`${anchorScenario.name} fail immediately`, async () => {
+      const page = await createHydratedStudioPublishPage(browser);
+      try {
+        await page.locator(anchorScenario.selector).evaluate((anchor) => {
+          anchor.parentElement.prepend(anchor.cloneNode(true));
+        });
+        const result = await waitForTikTokPublishReadiness(page, {
+          maxWaitMs: 1000,
+          pollIntervalMs: 100,
+        });
+        assert.equal(result.ok, false);
+        assert.equal(result.clickAttempted, false);
+        assert.equal(result.evidence.phase, "unknown-terminal");
+        assert.equal(result.evidence.reasonCode, "duplicate-check-anchors");
+        assert.equal(result.evidence.polls, 1);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("wrong Studio path fails immediately", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      pathName: "/tiktokstudio/content",
+    });
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(result.evidence.phase, "unknown-terminal");
+      assert.equal(result.evidence.reasonCode, "studio-upload-page-mismatch");
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("malformed structural observations remain terminal", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const validInfo = await collectTikTokPublishReadinessInfo(page);
+      for (const malformedInfo of [
+        { ...validInfo, musicAnchorCount: null },
+        { ...validInfo, contentAnchorCount: "1" },
+        { ...validInfo, uploadPendingVisible: null },
+      ]) {
+        const readiness = classifyTikTokPublishReadinessInfo(malformedInfo);
+        assert.equal(readiness.status, "unknown");
+        assert.equal(readiness.phase, "unknown-terminal");
+        assert.match(readiness.reasonCode, /^invalid-/);
+      }
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("exact structure with empty statuses hydrates but never becomes ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: "",
+      contentCheckStatus: "",
+    });
+    try {
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+      assert.equal(initial.phase, "hydrating-check-status");
+      assert.equal(initial.reasonCode, "check-status-not-materialized");
+      assert.equal(initial.evidence.musicState, "hydrating");
+      assert.equal(initial.evidence.contentState, "hydrating");
+
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(result.evidence.phase, "hydrating-check-status");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("real pending state becomes eligible only after exact safe state", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      const initial = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(initial.status, "pending");
+
+      await page.evaluate((safeStatus) => {
+        setTimeout(() => {
+          document.querySelector(".content-check .check-status").textContent =
+            safeStatus;
+        }, 10);
+      }, SAFE_CONTENT_CHECK_STATUS);
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 5,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.outcome, "ready");
+      assert.equal(result.evidence.musicState, "safe");
+      assert.equal(result.evidence.contentState, "safe");
+      assert.equal(result.evidence.qualifiedTargetCount, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("pending checks time out fail closed", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 0,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /bounded readiness timeout/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("upload completion message keeps readiness pending", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      uploadPending: true,
+    });
+    try {
+      const result = classifyTikTokPublishReadinessInfo(
+        await collectTikTokPublishReadinessInfo(page)
+      );
+      assert.equal(result.status, "pending");
+      assert.equal(result.evidence.uploadState, "pending");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "copyright warning",
+      musicCheckStatus: "Copyright issue found.",
+      expected: "warning",
+      reasonCode: "check-warning",
+    },
+    {
+      name: "copyright check failure",
+      musicCheckStatus: "Unable to complete the copyright check.",
+      expected: "failed",
+      reasonCode: "check-failed",
+    },
+    {
+      name: "unknown content check state",
+      contentCheckStatus: "Analysis queued for later review.",
+      expected: "unknown",
+      reasonCode: "unknown-check-status",
+    },
+  ]) {
+    await t.test(`${scenario.name} fails closed`, async () => {
+      const page = await createHydratedStudioPublishPage(browser, scenario);
+      try {
+        const readiness = classifyTikTokPublishReadinessInfo(
+          await collectTikTokPublishReadinessInfo(page)
+        );
+        assert.equal(readiness.status, scenario.expected);
+        assert.equal(readiness.reasonCode, scenario.reasonCode);
+        assert.notEqual(readiness.phase, "hydrating-check-status");
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("safe check reverting to pending before click aborts", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.locator(".content-check .check-status").evaluate(
+              (status, pendingText) => {
+                status.textContent = pendingText;
+              },
+              contentPending
+            );
+          },
+        })
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /readiness changed immediately before click/i);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("late dialog during readiness aborts without publish", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      await page.evaluate(() => {
+        setTimeout(() => {
+          const dialog = document.createElement("div");
+          dialog.id = "readiness-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:400px;top:100px;width:320px;height:200px";
+          dialog.textContent = "Unexpected dialog";
+          document.body.appendChild(dialog);
+        }, 10);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 200,
+        pollIntervalMs: 5,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.match(result.reason, /visible dialog/i);
+      assert.equal(result.evidence.phase, "blocked");
+      assert.equal(result.evidence.reasonCode, "visible-dialog");
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("target replaced during readiness is recollected before one click", async () => {
+    const page = await createHydratedStudioPublishPage(browser, {
+      musicCheckStatus: SAFE_MUSIC_CHECK_STATUS,
+      contentCheckStatus: contentPending,
+    });
+    try {
+      await page.evaluate((safeStatus) => {
+        setTimeout(() => {
+          const original = document.querySelector(
+            '[data-e2e="post_video_button"]'
+          );
+          const replacement = original.cloneNode(true);
+          replacement.id = "readiness-replacement-post";
+          original.replaceWith(replacement);
+          document.querySelector(".content-check .check-status").textContent =
+            safeStatus;
+        }, 10);
+      }, SAFE_CONTENT_CHECK_STATUS);
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          readinessMaxWaitMs: 200,
+          readinessPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.retryAllowed, false);
+      assert.equal(
+        await page.locator("#readiness-replacement-post").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two stable polls are required even when the first poll is ready", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 2);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("signature changes reset stable readiness polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalWaitForTimeout = page.waitForTimeout;
+    let waits = 0;
+    try {
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page
+            .locator('[data-e2e="post_video_button"]')
+            .evaluate((target) => {
+              target.textContent = "Publish";
+            });
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 3);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      await page.close();
+    }
+  });
+
+  await t.test("physical target replacement resets stable readiness polls", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalWaitForTimeout = page.waitForTimeout;
+    let waits = 0;
+    try {
+      page.waitForTimeout = async function () {
+        waits += 1;
+        if (waits === 1) {
+          await page
+            .locator('[data-e2e="post_video_button"]')
+            .evaluate((target) => {
+              const replacement = target.cloneNode(true);
+              replacement.id = "stable-readiness-replacement";
+              target.replaceWith(replacement);
+            });
+        }
+        return originalWaitForTimeout.call(page, 0);
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+        requiredStablePolls: 2,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.evidence.stablePolls, 2);
+      assert.equal(result.evidence.polls, 3);
+      assert.equal(
+        await page.locator("#stable-readiness-replacement").count(),
+        1
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.waitForTimeout = originalWaitForTimeout;
+      await page.close();
+    }
+  });
+
+  await t.test("multiple physical publish targets fail readiness immediately", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "readiness-duplicate-action-group";
+        original.parentElement.appendChild(duplicate);
+      });
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 100,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(
+        result.evidence.reasonCode,
+        "multiple-physical-publish-targets"
+      );
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("unavailable target diagnostics fail closed", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    const originalGetByRole = page.getByRole;
+    try {
+      page.getByRole = function (...args) {
+        const locator = originalGetByRole.apply(page, args);
+        locator.count = async () => {
+          throw new Error("fixture diagnostics unavailable");
+        };
+        return locator;
+      };
+      const result = await waitForTikTokPublishReadiness(page, {
+        maxWaitMs: 1000,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(
+        result.evidence.reasonCode,
+        "publish-target-diagnostics-unavailable"
+      );
+      assert.equal(result.evidence.polls, 1);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      page.getByRole = originalGetByRole;
+      await page.close();
+    }
+  });
+});
+
+test("TikTok never bypasses the incomplete-check transaction dialog", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+
+  await t.test("exact dialog after primary click remains untouched and uncertain", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, { afterPrimary: true });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(await page.locator("#continue-to-post-dialog").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("exact stale dialog before primary click fails closed", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page);
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "changed title",
+      title: "Continue publishing?",
+    },
+    {
+      name: "changed body",
+      bodyOne: "Accept the copyright policy before posting.",
+    },
+    {
+      name: "changed action",
+      postNowLabel: "Continue",
+    },
+  ]) {
+    await t.test(`${scenario.name} is an untouched unknown dialog`, async () => {
+      const page = await createPublishPage(browser);
+      try {
+        await installContinueToPostDialog(page, scenario);
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+        assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  for (const scenario of [
+    { name: "external Post now decoy", externalDecoy: true },
+    { name: "two Post now controls", extraPostNow: true },
+    { name: "two visible transaction dialogs", secondDialog: true },
+  ]) {
+    await t.test(`${scenario.name} receives zero clicks`, async () => {
+      const page = await createPublishPage(browser);
+      try {
+        await installContinueToPostDialog(page, scenario);
+        const result = await publishFailClosed(
+          page,
+          createResponseTracker(),
+          fastPublishOptions()
+        );
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+        assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+        assert.equal(await page.evaluate(() => window.secondaryDecoyClicks), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("dialog replacement after primary click remains untouched", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        replaceAfterOpen: true,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 5,
+          confirmationPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(
+        await page.locator("#continue-to-post-dialog-replacement").count(),
+        1
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("secondary button replacement after primary remains untouched", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        replacePostNowAfterOpen: true,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 5,
+          confirmationPollIntervalMs: 5,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+      assert.equal(await page.locator("#replacement-post-now").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("a consumed secondary budget never permits another click", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, {
+        afterPrimary: true,
+        secondaryConfirmClicks: 1,
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 1);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("unknown post-click dialog remains untouched and uncertain", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        window.unknownDialogClicks = 0;
+        document.querySelector("#publish").addEventListener("click", () => {
+          const dialog = document.createElement("div");
+          dialog.id = "unknown-post-click-dialog";
+          dialog.setAttribute("role", "dialog");
+          dialog.style.cssText =
+            "position:fixed;left:430px;top:200px;width:540px;height:268px;z-index:50";
+          dialog.innerHTML =
+            '<h2>Review required</h2><p>Unknown transaction state.</p>' +
+            '<button type="button" onclick="window.unknownDialogClicks += 1">Continue</button>';
+          document.body.appendChild(dialog);
+        });
+      });
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.unknownDialogClicks), 0);
+      assert.equal(await page.locator("#unknown-post-click-dialog").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("strong confirmation evidence never triggers dialog interaction", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await installContinueToPostDialog(page, { afterPrimary: true });
+      let evidence = null;
+      const tracker = {
+        arm() {
+          evidence = null;
+        },
+        beginClick(operationId, binding) {
+          evidence = {
+            type: "http",
+            method: "POST",
+            status: 200,
+            expectedOriginMatched: true,
+            requestStartedAfterClick: true,
+            responseCompletedAfterClick: true,
+            activeComposerMatched: binding.activeComposerMatched,
+            expectedCaptionMatched: true,
+            expectedOperationBindingMatched: true,
+            operationBindingMatched: true,
+            operationBindingKind: "project",
+            currentVideoMatched: binding.activeComposerMatched,
+            candidateRequestCount: 1,
+            operationId,
+            postId: "7420000000000000001",
+            postIdSource: "response-body",
+          };
+        },
+        success() {
+          return evidence;
+        },
+        failure() {
+          return null;
+        },
+        dispose() {},
+      };
+      const result = await publishFailClosed(
+        page,
+        tracker,
+        fastPublishOptions()
+      );
+      assert.equal(result.outcome, "success");
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.secondaryConfirmClicks), 0);
+      assert.equal(await page.evaluate(() => window.secondaryCancelClicks), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("production publish path contains no secondary action sink", () => {
+    const source = `${publishFailClosed.toString()} ${waitForPublishConfirmation.toString()}`;
+    assert.doesNotMatch(source, /Post now|Continue to post|secondaryConfirm|tiktokCancel/);
+  });
+});
+
+test("TikTok hydrated Studio binding fails closed when structural proof is incomplete", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const clickOptions = { maxPolls: 1, pollIntervalMs: 0, settleMs: 0 };
+
+  for (const scenario of [
+    {
+      name: "paired Discard action is missing",
+      options: { includeDiscard: false },
+    },
+    {
+      name: "same action region is outside the Studio upload path",
+      options: { pathName: "/tiktokstudio/content" },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const page = await createHydratedStudioPublishPage(
+        browser,
+        scenario.options
+      );
+      try {
+        const diagnostics = await collectPublishCandidateDiagnostics(page);
+        const postCandidate = diagnostics.candidates.find(
+          ({ dataE2e }) => dataE2e === "post_video_button"
+        );
+        assert.equal(postCandidate.status, "REJECTED");
+        assert.deepEqual(postCandidate.reasons, ["structural-binding-missing"]);
+        assert.equal(diagnostics.qualifiedTargetCount, 0);
+
+        const result = await clickPublishOnce(page, clickOptions);
+        assert.equal(result.outcome, "failure");
+        assert.equal(result.clickAttempted, false);
+        assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  await t.test("two physical verified action regions remain ambiguous", async () => {
+    const page = await createHydratedStudioPublishPage(browser);
+    try {
+      await page.evaluate(() => {
+        const original = document.querySelector(".button-group");
+        const duplicate = original.cloneNode(true);
+        duplicate.id = "second-physical-action-group";
+        duplicate.style.left = "520px";
+        original.parentElement.appendChild(duplicate);
+      });
+
+      const diagnostics = await collectPublishCandidateDiagnostics(page);
+      const verifiedPosts = diagnostics.candidates.filter(
+        ({ dataE2e }) => dataE2e === "post_video_button"
+      );
+      assert.equal(verifiedPosts.length, 2);
+      assert.equal(diagnostics.qualifiedTargetCount, 2);
+      assert.ok(
+        verifiedPosts.every(
+          ({ status, reasons }) =>
+            status === "REJECTED" &&
+            reasons.length === 1 &&
+            reasons[0] === "ambiguous-qualified-duplicate"
+        )
+      );
+
+      const result = await clickPublishOnce(page, clickOptions);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
 });
 
 test("TikTok publish target requires exact identity and active composer binding", async (t) => {
@@ -443,6 +3903,171 @@ test("TikTok publish target requires exact identity and active composer binding"
 test("TikTok final publish is fail-closed across confirmation paths", async (t) => {
   const browser = await chromium.launch({ headless: true });
   t.after(() => browser.close());
+
+  await t.test("missing captured operation binding aborts before the publish click", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          resolveExpectedOperationBinding: () => ({
+            ok: false,
+            reasonCode: "binding-not-observed",
+          }),
+        })
+      );
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.retryAllowed, true);
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("bound mocked publish response confirms the one-click operation", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/?session_token=fixture', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 10,
+          confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+          resolveExpectedOperationBinding: () => ({
+            ok: true,
+            binding: EXPECTED_PUBLISH_OPERATION_BINDING,
+          }),
+        })
+      );
+      assert.equal(result.outcome, "success", JSON.stringify(result));
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, true);
+      assert.equal(result.evidence.postId, "7420000000000000001");
+      assert.equal(
+        result.evidence.url,
+        "https://www.tiktok.com/tiktok/web/project/post/v1/"
+      );
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("matching mocked response remains uncertain without a pre-established operation binding", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 3,
+          confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+        })
+      );
+      assert.equal(result.outcome, "uncertain", JSON.stringify(result));
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("two populated files keep a valid mocked response unbound", async () => {
+    const page = await createPublishPage(browser, {
+      onClick:
+        "window.publishClickCount += 1; fetch('/tiktok/web/project/post/v1/', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({project_id:'current-project',caption:'fixture caption'})});",
+    });
+    await page.locator("#upload-composer").evaluate((composer) => {
+      const secondInput = document.createElement("input");
+      secondInput.id = "second-upload-input";
+      secondInput.type = "file";
+      composer.appendChild(secondInput);
+    });
+    await page.locator("#second-upload-input").setInputFiles({
+      name: "second-fixture.mp4",
+      mimeType: "video/mp4",
+      buffer: Buffer.from("second local fixture"),
+    });
+    await page.unroute("https://www.tiktok.com/**");
+    await page.route(
+      "https://www.tiktok.com/tiktok/web/project/post/v1/**",
+      (route) =>
+        route.fulfill({
+          body: JSON.stringify({
+            code: 0,
+            data: {
+              project_id: "current-project",
+              post_id: "7420000000000000001",
+            },
+          }),
+          contentType: "application/json",
+          status: 200,
+        })
+    );
+    try {
+      const result = await publishFailClosed(
+        page,
+        null,
+        fastPublishOptions({
+          confirmationMaxPolls: 3,
+          confirmationPollIntervalMs: 10,
+          expectedCaption: "fixture caption",
+          expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+        })
+      );
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(result.evidence.currentVideoMatched, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+    } finally {
+      await page.close();
+    }
+  });
 
   await t.test("unbound DOM status remains uncertain after one click", async () => {
     const page = await createPublishPage(browser, {
@@ -579,6 +4204,90 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
     }
   });
 
+  await t.test("automatic content checks dialog blocks final publish without interaction", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      await page.evaluate(() => {
+        const dialog = document.createElement("div");
+        dialog.id = "automatic-content-checks";
+        dialog.setAttribute("role", "dialog");
+        dialog.style.cssText =
+          "position:fixed;left:200px;top:100px;width:360px;height:240px";
+        dialog.innerHTML =
+          "<h2>Turn on automatic content checks?</h2>" +
+          '<button onclick="window.contentCheckClicks += 1">Cancel</button>' +
+          '<button onclick="window.contentCheckClicks += 1">Turn on</button>';
+        document.body.appendChild(dialog);
+        window.contentCheckClicks = 0;
+      });
+
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions()
+      );
+
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.contentCheckClicks), 0);
+      assert.equal(await page.locator("#automatic-content-checks").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("phone preview appearing after publish click is never dismissed", async () => {
+    const page = await createPublishPage(browser);
+    try {
+      await page.locator("#publish").evaluate(
+        (button, { title, body }) => {
+          button.addEventListener("click", () => {
+            const dialog = document.createElement("div");
+            dialog.id = "post-click-phone-preview";
+            dialog.className = "react-joyride__tooltip";
+            dialog.setAttribute("role", "alertdialog");
+            dialog.setAttribute("aria-modal", "true");
+            dialog.setAttribute("aria-label", `${title}${body}Got it`);
+            dialog.style.cssText =
+              "position:fixed;left:700px;top:100px;width:280px;height:336px";
+            dialog.innerHTML =
+              `<div class="tutorial-tooltip__title">${title}</div>` +
+              `<div class="tutorial-tooltip__desc">${body}</div>` +
+              '<div class="tutorial-tooltip__footer"><button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 1">Got it</button></div>';
+            document.body.appendChild(dialog);
+          });
+        },
+        {
+          title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+          body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+        }
+      );
+      await page.evaluate(() => {
+        window.phonePreviewClicks = 0;
+      });
+
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          confirmationMaxPolls: 2,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.clickAttempted, true);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 1);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#post-click-phone-preview").count(), 1);
+    } finally {
+      await page.close();
+    }
+  });
+
   await t.test("late visible dialog aborts final publish with zero clicks", async () => {
     const page = await createPublishPage(browser, { buttonLabel: "Publish" });
     try {
@@ -611,6 +4320,98 @@ test("TikTok final publish is fail-closed across confirmation paths", async (t) 
       assert.equal(await page.evaluate(() => window.publishClickCount), 0);
       assert.equal(await page.evaluate(() => window.dialogClickCount), 0);
       assert.equal(await page.locator("#late-dialog").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("known onboarding appearing at final publish boundary is not dismissed", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.evaluate(
+              ({ title, body }) => {
+                const dialog = document.createElement("div");
+                dialog.id = "late-known-onboarding";
+                dialog.setAttribute("role", "dialog");
+                dialog.style.cssText =
+                  "position:fixed;left:200px;top:100px;width:360px;height:240px";
+                dialog.innerHTML =
+                  `<h2>${title}</h2><p>${body}</p>` +
+                  '<button onclick="window.knownOnboardingClicks += 1; this.parentElement.remove()">Got it</button>';
+                document.body.appendChild(dialog);
+                window.knownOnboardingClicks = 0;
+              },
+              {
+                title: KNOWN_EDITOR_ONBOARDING_TITLE,
+                body: KNOWN_EDITOR_ONBOARDING_BODY,
+              }
+            );
+          },
+          confirmationMaxPolls: 1,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.knownOnboardingClicks), 0);
+      assert.equal(await page.locator("#late-known-onboarding").count(), 1);
+      assert.match(result.reason, /blocked by a visible dialog/i);
+    } finally {
+      await page.close();
+    }
+  });
+
+  await t.test("phone preview appearing at final publish boundary is not dismissed", async () => {
+    const page = await createPublishPage(browser, { buttonLabel: "Publish" });
+    try {
+      const result = await publishFailClosed(
+        page,
+        createResponseTracker(),
+        fastPublishOptions({
+          beforeFinalValidation: async () => {
+            await page.evaluate(
+              ({ title, body }) => {
+                const dialog = document.createElement("div");
+                dialog.id = "late-phone-preview";
+                dialog.className = "react-joyride__tooltip";
+                dialog.setAttribute("role", "alertdialog");
+                dialog.setAttribute("aria-modal", "true");
+                dialog.setAttribute("aria-label", `${title}${body}Got it`);
+                dialog.style.cssText =
+                  "position:fixed;left:700px;top:100px;width:280px;height:336px";
+                dialog.innerHTML =
+                  `<div class="tutorial-tooltip__title">${title}</div>` +
+                  `<div class="tutorial-tooltip__desc">${body}</div>` +
+                  '<div class="tutorial-tooltip__footer"><button type="button" role="button" aria-disabled="false" onclick="window.phonePreviewClicks += 1">Got it</button></div>';
+                document.body.appendChild(dialog);
+                window.phonePreviewClicks = 0;
+              },
+              {
+                title: KNOWN_PHONE_PREVIEW_ONBOARDING_TITLE,
+                body: KNOWN_PHONE_PREVIEW_ONBOARDING_BODY,
+              }
+            );
+          },
+          confirmationMaxPolls: 1,
+          confirmationPollIntervalMs: 0,
+        })
+      );
+
+      assert.equal(result.ok, false);
+      assert.equal(result.outcome, "failure");
+      assert.equal(result.clickAttempted, false);
+      assert.equal(await page.evaluate(() => window.publishClickCount), 0);
+      assert.equal(await page.evaluate(() => window.phonePreviewClicks), 0);
+      assert.equal(await page.locator("#late-phone-preview").count(), 1);
       assert.match(result.reason, /blocked by a visible dialog/i);
     } finally {
       await page.close();

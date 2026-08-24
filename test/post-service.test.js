@@ -210,6 +210,34 @@ test("confirmed and definitive failed uploads preserve existing destinations", a
   assert.equal(videoNames(await fs.readdir(failed.failedDir)).length, 1);
 });
 
+test("post service preserves TikTok target resolution diagnostics", async () => {
+  const queue = await makeQueue();
+  const diagnostics = {
+    schemaVersion: 1,
+    directPostCount: 1,
+    finalTargetCount: 0,
+    targets: [{ playwrightVisible: false, infoVisible: true }],
+  };
+  uploadImplementation = async () => ({
+    ok: false,
+    outcome: "failure",
+    retryAllowed: true,
+    clickAttempted: false,
+    reason: "target unavailable after preparation",
+    error: "target unavailable after preparation",
+    diagnostics,
+  });
+
+  const result = await postNextFromQueue(queue);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, "failure");
+  assert.equal(result.retryAllowed, true);
+  assert.equal(result.clickAttempted, false);
+  assert.equal(result.durableState, "failed");
+  assert.deepEqual(result.diagnostics, diagnostics);
+});
+
 test("uploader receives only the claim-owned video snapshot and claimed caption", async () => {
   const queue = await makeQueue();
   const originalCaptionPath = path.join(queue.queueDir, "clip.description");

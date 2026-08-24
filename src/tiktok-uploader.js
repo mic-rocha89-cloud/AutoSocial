@@ -29,23 +29,29 @@ async function gotoUploadPage(page) {
   await page.goto(config.uploadPageUrl, { waitUntil: "domcontentloaded" });
 }
 
-async function setVideoFile(page, videoPath) {
+async function setVideoFile(page, videoPath, { beforeAssignment } = {}) {
   const fileInput = page.locator('input[type="file"]').first();
   await fileInput.waitFor({ state: "attached", timeout: 120000 });
-  await fileInput.setInputFiles(videoPath);
+  if (typeof beforeAssignment === "function") {
+    beforeAssignment();
+  }
+  const assignment = fileInput.setInputFiles(videoPath);
+  await assignment;
 }
 
 async function setCaption(page, caption) {
-  if (!caption) {
-    return;
-  }
-
-  const overlayState = await detectInterferingOverlays(page);
-  if (overlayState.blocked) {
+  const onboardingState = await dismissKnownTikTokPrePublishOnboarding(page, {
+    phase: "pre-caption",
+  });
+  if (onboardingState.blocked) {
     throw new Error(
       "TikTok caption editing is blocked by a visible dialog; " +
         "automatic dialog interaction is disabled."
     );
+  }
+
+  if (!caption) {
+    return;
   }
 
   const candidates = [
@@ -127,39 +133,1034 @@ function normalizeUiText(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
+function getPublishClickAttempted(error) {
+  return typeof error?.clickAttempted === "boolean"
+    ? error.clickAttempted
+    : false;
+}
+
+function buildTikTokUploadFailureResult(error, screenshotPath) {
+  return {
+    ok: false,
+    outcome: error.outcome || "failure",
+    retryAllowed:
+      typeof error.retryAllowed === "boolean" ? error.retryAllowed : true,
+    error: error.message,
+    reason: error.reason || error.message,
+    evidence: error.evidence,
+    diagnostics: error.diagnostics,
+    clickAttempted: getPublishClickAttempted(error),
+    screenshotPath,
+  };
+}
+
+const KNOWN_TIKTOK_EDITOR_ONBOARDING = Object.freeze({
+  id: "editor-features",
+  title: "New editing features added",
+  body:
+    "Now it's easier than ever before to create professional and engaging videos.",
+  button: "Got it",
+  allowedPhases: Object.freeze(["pre-caption"]),
+  detectedLog: "Known TikTok onboarding dialog detected.",
+  dismissedLog: "Known TikTok onboarding dialog dismissed safely.",
+});
+
+const KNOWN_TIKTOK_PHONE_PREVIEW_ONBOARDING = Object.freeze({
+  id: "phone-preview",
+  title: "Preview your video on your phone",
+  body: "Now you can view your video as it will appear on TikTok.",
+  button: "Got it",
+  allowedPhases: Object.freeze(["pre-caption"]),
+  detectedLog:
+    "Known TikTok phone-preview onboarding dialog detected.",
+  dismissedLog:
+    "Known TikTok phone-preview onboarding dialog dismissed safely.",
+  reappearedLog:
+    "Known TikTok phone-preview onboarding dialog reappeared after allowed dismiss; failing closed.",
+  structure: Object.freeze({
+    containerTag: "DIV",
+    containerRole: "alertdialog",
+    containerAriaModal: "true",
+    containerClassToken: "react-joyride__tooltip",
+    exactContainerAriaLabel: true,
+    titleClassToken: "tutorial-tooltip__title",
+    bodyClassToken: "tutorial-tooltip__desc",
+    actionFooterClassToken: "tutorial-tooltip__footer",
+    buttonTag: "BUTTON",
+    buttonRole: "button",
+    buttonType: "button",
+    buttonAriaDisabled: "false",
+  }),
+});
+
+const KNOWN_TIKTOK_PRE_PUBLISH_ONBOARDINGS = Object.freeze([
+  KNOWN_TIKTOK_EDITOR_ONBOARDING,
+  KNOWN_TIKTOK_PHONE_PREVIEW_ONBOARDING,
+]);
+
+const TIKTOK_PUBLISH_READINESS = Object.freeze({
+  origin: "https://www.tiktok.com",
+  path: "/tiktokstudio/upload",
+  uploadPendingText: "Checks can only start after the file is uploaded.",
+  music: Object.freeze({
+    title: "Music copyright check",
+    selector: '[data-e2e="copyright_container"]',
+    pending: Object.freeze([
+      "We'll check if your video has any unauthorized music that may cause it to be muted.",
+      "Checking in progress. This will take about 30 seconds.",
+    ]),
+    safe: Object.freeze(["No issues found."]),
+  }),
+  content: Object.freeze({
+    title: "Content check lite",
+    selector: ".headline-wrapper",
+    pending: Object.freeze([
+      "We'll check your content for For You Feed eligibility.",
+      "Checking in progress. This will take about 10 minutes. Longer videos may take more time.",
+    ]),
+    safe: Object.freeze([
+      "No issues found. However, your video could still be removed later if it violates our Community Guidelines.",
+    ]),
+  }),
+});
+
+function classifyTikTokCheckState(statusText, fingerprint) {
+  const status = normalizeUiText(statusText);
+  const pending = new Set(fingerprint.pending.map(normalizeUiText));
+  const safe = new Set(fingerprint.safe.map(normalizeUiText));
+
+  if (!status) return "hydrating";
+  if (safe.has(status)) return "safe";
+  if (pending.has(status)) return "pending";
+  if (/\b(?:failed|unable|could not|couldn't)\b/.test(status)) return "failed";
+  if (
+    /\b(?:warning|issues? found|copyright detected|not eligible|restricted|blocked|muted)\b/.test(
+      status
+    )
+  ) {
+    return "warning";
+  }
+  return "unknown";
+}
+
+function createTikTokReadinessClassification({
+  status,
+  phase,
+  reasonCode,
+  reason,
+  evidence,
+}) {
+  return {
+    status,
+    phase,
+    reasonCode,
+    reason,
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
+function classifyTikTokPublishReadinessInfo(info) {
+  if (!info) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "readiness-info-unavailable",
+      reason: "TikTok publish readiness information is unavailable.",
+    });
+  }
+  if (
+    info.pageOrigin !== TIKTOK_PUBLISH_READINESS.origin ||
+    normalizeUiText(info.pagePath) !== TIKTOK_PUBLISH_READINESS.path
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "studio-upload-page-mismatch",
+      reason: "TikTok publish readiness was observed outside the exact Studio upload page.",
+      evidence: info,
+    });
+  }
+  const visibleDialogCount = info.visibleDialogCount;
+  if (
+    !Number.isInteger(visibleDialogCount) ||
+    visibleDialogCount < 0 ||
+    typeof info.uploadPendingVisible !== "boolean"
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-readiness-observation",
+      reason: "TikTok publish readiness observation is incomplete.",
+      evidence: info,
+    });
+  }
+  if (visibleDialogCount > 0) {
+    return createTikTokReadinessClassification({
+      status: "blocked",
+      phase: "blocked",
+      reasonCode: "visible-dialog",
+      reason: "TikTok publish readiness is blocked by a visible dialog.",
+      evidence: info,
+    });
+  }
+
+  const musicAnchorCount = info.musicAnchorCount;
+  const contentAnchorCount = info.contentAnchorCount;
+  if (
+    !Number.isInteger(musicAnchorCount) ||
+    !Number.isInteger(contentAnchorCount) ||
+    musicAnchorCount < 0 ||
+    contentAnchorCount < 0
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-check-anchor-counts",
+      reason: "TikTok publish check anchor counts are invalid.",
+      evidence: info,
+    });
+  }
+  if (musicAnchorCount > 1 || contentAnchorCount > 1) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "duplicate-check-anchors",
+      reason: "TikTok publish check structure contains duplicate anchors.",
+      evidence: info,
+    });
+  }
+  if (
+    (musicAnchorCount === 1 &&
+      typeof info.musicStatusText !== "string") ||
+    (contentAnchorCount === 1 &&
+      typeof info.contentStatusText !== "string")
+  ) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "invalid-check-status-observation",
+      reason: "TikTok publish check status observation is incomplete.",
+      evidence: info,
+    });
+  }
+
+  const musicState =
+    musicAnchorCount === 0
+      ? "missing"
+      : classifyTikTokCheckState(
+          info.musicStatusText,
+          TIKTOK_PUBLISH_READINESS.music
+        );
+  const contentState =
+    contentAnchorCount === 0
+      ? "missing"
+      : classifyTikTokCheckState(
+          info.contentStatusText,
+          TIKTOK_PUBLISH_READINESS.content
+        );
+  const evidence = {
+    ...info,
+    musicState,
+    contentState,
+  };
+
+  if (musicState === "failed" || contentState === "failed") {
+    return createTikTokReadinessClassification({
+      status: "failed",
+      phase: "failed",
+      reasonCode: "check-failed",
+      reason: "TikTok reported a failed publish check.",
+      evidence,
+    });
+  }
+  if (musicState === "warning" || contentState === "warning") {
+    return createTikTokReadinessClassification({
+      status: "warning",
+      phase: "warning",
+      reasonCode: "check-warning",
+      reason: "TikTok reported a publish check warning.",
+      evidence,
+    });
+  }
+  if (musicState === "unknown" || contentState === "unknown") {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "unknown-check-status",
+      reason: "TikTok publish check state is unknown.",
+      evidence,
+    });
+  }
+
+  const hasExactAnchorStructure =
+    musicAnchorCount === 1 && contentAnchorCount === 1;
+  if (!hasExactAnchorStructure) {
+    evidence.uploadState = info.uploadPendingVisible ? "pending" : "unknown";
+    return createTikTokReadinessClassification({
+      status: "pending",
+      phase: "hydrating-check-structure",
+      reasonCode: "check-structure-not-materialized",
+      reason: "TikTok publish check structure is still hydrating.",
+      evidence,
+    });
+  }
+  if (info.sameCheckRegion !== true) {
+    return createTikTokReadinessClassification({
+      status: "unknown",
+      phase: "unknown-terminal",
+      reasonCode: "check-region-mismatch",
+      reason: "TikTok publish check anchors are not in one exact region.",
+      evidence,
+    });
+  }
+  if (musicState === "hydrating" || contentState === "hydrating") {
+    evidence.uploadState = info.uploadPendingVisible ? "pending" : "complete";
+    return createTikTokReadinessClassification({
+      status: "pending",
+      phase: "hydrating-check-status",
+      reasonCode: "check-status-not-materialized",
+      reason: "TikTok publish check status text is still hydrating.",
+      evidence,
+    });
+  }
+
+  const uploadState = info.uploadPendingVisible
+    ? "pending"
+    : [musicState, contentState].every((state) =>
+          ["safe", "pending"].includes(state)
+        )
+      ? "complete"
+      : "unknown";
+  evidence.uploadState = uploadState;
+
+  if (
+    uploadState === "pending" ||
+    musicState === "pending" ||
+    contentState === "pending"
+  ) {
+    return createTikTokReadinessClassification({
+      status: "pending",
+      phase: "waiting-for-checks",
+      reasonCode: "checks-pending",
+      reason: "TikTok upload or publish checks are still pending.",
+      evidence,
+    });
+  }
+  if (
+    uploadState === "complete" &&
+    musicState === "safe" &&
+    contentState === "safe"
+  ) {
+    return createTikTokReadinessClassification({
+      status: "ready",
+      phase: "ready",
+      reasonCode: "checks-safe",
+      reason: "TikTok upload and publish checks reached exact safe states.",
+      evidence,
+    });
+  }
+
+  return createTikTokReadinessClassification({
+    status: "unknown",
+    phase: "unknown-terminal",
+    reasonCode: "readiness-unproven",
+    reason: "TikTok publish readiness could not be proven.",
+    evidence,
+  });
+}
+
+async function collectTikTokPublishReadinessInfo(page) {
+  return page.evaluate((fingerprint) => {
+    const normalize = (value) =>
+      String(value || "").trim().replace(/\s+/g, " ");
+    const isVisible = (element) => {
+      if (!element?.isConnected) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    };
+    const exactVisibleAnchors = (selector, title) =>
+      Array.from(document.querySelectorAll(selector)).filter(
+        (element) => isVisible(element) && normalize(element.innerText) === title
+      );
+    const getStatusText = (section, title) => {
+      const text = normalize(section?.innerText);
+      const prefix = `${title} `;
+      return text.startsWith(prefix) ? text.slice(prefix.length) : "";
+    };
+
+    const musicAnchors = exactVisibleAnchors(
+      fingerprint.music.selector,
+      fingerprint.music.title
+    );
+    const contentAnchors = exactVisibleAnchors(
+      fingerprint.content.selector,
+      fingerprint.content.title
+    );
+    const musicSection =
+      musicAnchors.length === 1 ? musicAnchors[0].parentElement : null;
+    const contentSection =
+      contentAnchors.length === 1 ? contentAnchors[0].parentElement : null;
+    const visibleDialogs = Array.from(
+      document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+      )
+    ).filter(isVisible);
+    const uploadPendingVisible = Array.from(
+      document.querySelectorAll("body *")
+    ).some(
+      (element) =>
+        isVisible(element) &&
+        normalize(element.innerText) === fingerprint.uploadPendingText
+    );
+
+    return {
+      contentAnchorCount: contentAnchors.length,
+      contentStatusText: getStatusText(
+        contentSection,
+        fingerprint.content.title
+      ),
+      musicAnchorCount: musicAnchors.length,
+      musicStatusText: getStatusText(musicSection, fingerprint.music.title),
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
+      sameCheckRegion: Boolean(
+        musicSection &&
+          contentSection &&
+          musicSection.parentElement === contentSection.parentElement
+      ),
+      uploadPendingVisible,
+      visibleDialogCount: visibleDialogs.length,
+    };
+  }, TIKTOK_PUBLISH_READINESS);
+}
+
+async function waitForTikTokPublishReadiness(
+  page,
+  {
+    maxWaitMs = 12 * 60 * 1000,
+    pollIntervalMs = 5000,
+    requiredStablePolls = 2,
+    onTransition = null,
+  } = {}
+) {
+  const safeMaxWaitMs = Math.max(0, Number(maxWaitMs) || 0);
+  const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
+  const safeRequiredStablePolls = Math.max(
+    1,
+    Number(requiredStablePolls) || 1
+  );
+  const startedAt = Date.now();
+  const deadline = Date.now() + safeMaxWaitMs;
+  let lastLoggedState = "";
+  let stableSignature = "";
+  let stablePolls = 0;
+  let stableTargetHandle = null;
+  let polls = 0;
+  let lastQualifiedTargetCount = null;
+  let lastPhysicalTargetCount = null;
+
+  const runtimeEvidence = (readiness, extra = {}) => ({
+    ...(readiness.evidence || {}),
+    phase: readiness.phase,
+    reasonCode: readiness.reasonCode,
+    elapsedMs: Math.max(0, Date.now() - startedAt),
+    polls,
+    ...(lastQualifiedTargetCount === null
+      ? {}
+      : { qualifiedTargetCount: lastQualifiedTargetCount }),
+    ...(lastPhysicalTargetCount === null
+      ? {}
+      : { physicalTargetCount: lastPhysicalTargetCount }),
+    ...extra,
+  });
+  const resetStableReadiness = async () => {
+    stablePolls = 0;
+    stableSignature = "";
+    if (stableTargetHandle) {
+      await stableTargetHandle.dispose().catch(() => {});
+      stableTargetHandle = null;
+    }
+  };
+
+  try {
+    while (true) {
+      polls += 1;
+      const info = await collectTikTokPublishReadinessInfo(page).catch(
+        () => null
+      );
+      const readiness = classifyTikTokPublishReadinessInfo(info);
+      const significantState = {
+        phase: readiness.phase,
+        status: readiness.status,
+        reasonCode: readiness.reasonCode,
+        musicAnchorCount: readiness.evidence?.musicAnchorCount ?? null,
+        contentAnchorCount: readiness.evidence?.contentAnchorCount ?? null,
+        musicState: readiness.evidence?.musicState || "unknown",
+        contentState: readiness.evidence?.contentState || "unknown",
+        uploadState: readiness.evidence?.uploadState || "unknown",
+        visibleDialogCount:
+          readiness.evidence?.visibleDialogCount ?? null,
+      };
+      const logState = JSON.stringify(significantState);
+      if (logState !== lastLoggedState) {
+        const transition = Object.freeze({
+          ...significantState,
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          polls,
+          clickAttempted: false,
+        });
+        console.log(
+          `TikTok publish readiness: ${JSON.stringify(transition)}`
+        );
+        if (typeof onTransition === "function") {
+          await onTransition(transition);
+        }
+        lastLoggedState = logState;
+      }
+
+      if (readiness.status === "ready") {
+        const diagnostics = await collectPublishCandidateDiagnostics(
+          page
+        ).catch(() => null);
+        if (!diagnostics) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason: "TikTok publish target readiness could not be inspected.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "publish-target-diagnostics-unavailable",
+            }),
+          };
+        }
+        lastQualifiedTargetCount = diagnostics.qualifiedTargetCount;
+        lastPhysicalTargetCount = await page
+          .locator('[data-e2e="post_video_button"]')
+          .count()
+          .catch(() => null);
+        if (lastPhysicalTargetCount === null) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason: "TikTok publish target readiness could not be inspected.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "publish-target-diagnostics-unavailable",
+              diagnostics,
+            }),
+          };
+        }
+        if (
+          lastPhysicalTargetCount > 1 ||
+          diagnostics.qualifiedTargetCount > 1
+        ) {
+          return {
+            ok: false,
+            outcome: "failure",
+            retryAllowed: true,
+            clickAttempted: false,
+            reason:
+              "TikTok publish readiness found multiple physical publish targets.",
+            evidence: runtimeEvidence(readiness, {
+              phase: "unknown-terminal",
+              reasonCode: "multiple-physical-publish-targets",
+              diagnostics,
+            }),
+          };
+        }
+        if (diagnostics.qualifiedTargetCount === 1) {
+          const target = diagnostics.candidates.find(
+            ({ status }) => status === "ACCEPTED"
+          );
+          if (
+            lastPhysicalTargetCount !== 1 ||
+            target?.dataE2e !== "post_video_button"
+          ) {
+            await resetStableReadiness();
+          } else {
+            const currentTargetHandle = await getCanonicalPublishOwner(
+              page.locator('[data-e2e="post_video_button"]').first()
+            );
+            if (!currentTargetHandle) {
+              return {
+                ok: false,
+                outcome: "failure",
+                retryAllowed: true,
+                clickAttempted: false,
+                reason:
+                  "TikTok publish target readiness could not be inspected.",
+                evidence: runtimeEvidence(readiness, {
+                  phase: "unknown-terminal",
+                  reasonCode: "publish-target-owner-unavailable",
+                  diagnostics,
+                }),
+              };
+            }
+            const samePhysicalTarget = stableTargetHandle
+              ? await currentTargetHandle
+                  .evaluate(
+                    (element, previous) => element === previous,
+                    stableTargetHandle
+                  )
+                  .catch(() => false)
+              : false;
+            const signature = JSON.stringify({
+              contentStatusText: readiness.evidence.contentStatusText,
+              dataE2e: target.dataE2e,
+              label: normalizeUiText(target.text || target.ariaLabel),
+              musicStatusText: readiness.evidence.musicStatusText,
+              pageOrigin: target.pageOrigin || "",
+              pagePath: target.pagePath || "",
+              structuralBinding: target.structuralBinding || "",
+            });
+            stablePolls =
+              samePhysicalTarget && signature === stableSignature
+                ? stablePolls + 1
+                : 1;
+            stableSignature = signature;
+            if (stableTargetHandle) {
+              await stableTargetHandle.dispose().catch(() => {});
+            }
+            stableTargetHandle = currentTargetHandle;
+            if (stablePolls >= safeRequiredStablePolls) {
+              return {
+                ok: true,
+                outcome: "ready",
+                retryAllowed: true,
+                clickAttempted: false,
+                reason: readiness.reason,
+                evidence: runtimeEvidence(readiness, {
+                  phase: "ready",
+                  reasonCode: "checks-safe-and-stable",
+                  stablePolls,
+                }),
+              };
+            }
+          }
+        } else {
+          await resetStableReadiness();
+        }
+      } else if (readiness.status !== "pending") {
+        return {
+          ok: false,
+          outcome: "failure",
+          retryAllowed: true,
+          clickAttempted: false,
+          reason: readiness.reason,
+          evidence: runtimeEvidence(readiness),
+        };
+      } else {
+        await resetStableReadiness();
+      }
+
+      if (Date.now() >= deadline) {
+        return {
+          ok: false,
+          outcome: "failure",
+          retryAllowed: true,
+          clickAttempted: false,
+          reason:
+            "TikTok upload or publish checks remained pending until the bounded readiness timeout.",
+          evidence: runtimeEvidence(readiness, { stablePolls }),
+        };
+      }
+      await page.waitForTimeout(safePollIntervalMs);
+    }
+  } finally {
+    if (stableTargetHandle) {
+      await stableTargetHandle.dispose().catch(() => {});
+    }
+  }
+}
+
+function createKnownOnboardingDismissGuard() {
+  let dismissAttempts = 0;
+  const maxDismissAttempts = 1;
+
+  return {
+    consume() {
+      if (dismissAttempts >= maxDismissAttempts) {
+        throw new Error(
+          "TikTok known onboarding dismiss budget is already exhausted."
+        );
+      }
+      dismissAttempts += 1;
+    },
+  };
+}
+
+async function inspectKnownTikTokOnboarding(
+  dialog,
+  fingerprint,
+  { expectedButton = null, requireOnlyVisibleDialog = false } = {}
+) {
+  return dialog.evaluate(
+    (container, inspection) => {
+      const normalize = (value) =>
+        String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+      const isVisible = (element) => {
+        if (!element?.isConnected) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return (
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+      };
+      const expected = inspection.fingerprint;
+      const structure = expected.structure || {};
+      const expectedDialogText = normalize(
+        `${expected.title} ${expected.body} ${expected.button}`
+      );
+      const expectedAriaLabel = normalize(
+        `${expected.title}${expected.body}${expected.button}`
+      );
+      const descendants = Array.from(container.querySelectorAll("*"));
+      const exactVisibleTextNodes = (text) =>
+        descendants.filter(
+          (element) =>
+            isVisible(element) && normalize(element.innerText) === normalize(text)
+        );
+      const titleNodes = exactVisibleTextNodes(expected.title);
+      const bodyNodes = exactVisibleTextNodes(expected.body);
+      const titleNode = titleNodes.length === 1 ? titleNodes[0] : null;
+      const bodyNode = bodyNodes.length === 1 ? bodyNodes[0] : null;
+      const controls = Array.from(
+        container.querySelectorAll("button, [role='button']")
+      );
+      const visibleControls = controls.filter(isVisible);
+      const button = visibleControls.length === 1 ? visibleControls[0] : null;
+      const buttonText = normalize(button?.innerText || button?.textContent);
+      const buttonAriaLabel = normalize(button?.getAttribute("aria-label"));
+      const exactButtonIdentity =
+        buttonText === normalize(expected.button) &&
+        (!buttonAriaLabel || buttonAriaLabel === normalize(expected.button)) &&
+        !button?.disabled &&
+        normalize(button?.getAttribute("aria-disabled")) !== "true";
+      const hasClassToken = (element, token) =>
+        !token || Boolean(element?.classList?.contains(token));
+      const containerStructureMatches =
+        (!structure.containerTag || container.tagName === structure.containerTag) &&
+        (!structure.containerRole ||
+          container.getAttribute("role") === structure.containerRole) &&
+        (!structure.containerAriaModal ||
+          container.getAttribute("aria-modal") === structure.containerAriaModal) &&
+        hasClassToken(container, structure.containerClassToken) &&
+        (!structure.exactContainerAriaLabel ||
+          normalize(container.getAttribute("aria-label")) === expectedAriaLabel);
+      const textStructureMatches =
+        titleNodes.length === 1 &&
+        bodyNodes.length === 1 &&
+        hasClassToken(titleNode, structure.titleClassToken) &&
+        hasClassToken(bodyNode, structure.bodyClassToken);
+      const actionFooter = structure.actionFooterClassToken
+        ? button?.closest(`.${structure.actionFooterClassToken}`)
+        : null;
+      const buttonStructureMatches =
+        (!structure.buttonTag || button?.tagName === structure.buttonTag) &&
+        (!structure.buttonRole ||
+          button?.getAttribute("role") === structure.buttonRole) &&
+        (!structure.buttonType ||
+          button?.getAttribute("type") === structure.buttonType) &&
+        (!structure.buttonAriaDisabled ||
+          button?.getAttribute("aria-disabled") ===
+            structure.buttonAriaDisabled) &&
+        (!structure.actionFooterClassToken ||
+          (actionFooter && container.contains(actionFooter)));
+      const visibleDialogs = inspection.requireOnlyVisibleDialog
+        ? Array.from(
+            document.querySelectorAll(
+              '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+            )
+          ).filter(isVisible)
+        : [];
+      const onlyVisibleDialog =
+        !inspection.requireOnlyVisibleDialog ||
+        (visibleDialogs.length === 1 && visibleDialogs[0] === container);
+      const sameButton = !inspection.expectedButton || button === inspection.expectedButton;
+      const matches =
+        isVisible(container) &&
+        onlyVisibleDialog &&
+        normalize(container.innerText) === expectedDialogText &&
+        containerStructureMatches &&
+        textStructureMatches &&
+        exactButtonIdentity &&
+        buttonStructureMatches &&
+        sameButton;
+
+      return {
+        buttonIndex: button ? controls.indexOf(button) : -1,
+        matches,
+      };
+    },
+    {
+      expectedButton,
+      fingerprint,
+      requireOnlyVisibleDialog,
+    }
+  );
+}
+
+async function recognizeKnownTikTokPrePublishOnboarding(
+  dialog,
+  { phase, expectedButton = null, requireOnlyVisibleDialog = false } = {}
+) {
+  const matches = [];
+
+  for (const fingerprint of KNOWN_TIKTOK_PRE_PUBLISH_ONBOARDINGS) {
+    if (!fingerprint.allowedPhases.includes(phase)) {
+      continue;
+    }
+    const inspection = await inspectKnownTikTokOnboarding(dialog, fingerprint, {
+      expectedButton,
+      requireOnlyVisibleDialog,
+    }).catch(() => null);
+    if (inspection?.matches) {
+      matches.push({ fingerprint, inspection });
+    }
+  }
+
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function hasVisibleKnownTikTokOnboarding(page, fingerprint) {
+  const dialogHandles = await page
+    .locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
+    .elementHandles();
+
+  try {
+    for (const dialog of dialogHandles) {
+      if (!(await dialog.isVisible().catch(() => false))) {
+        continue;
+      }
+      const inspection = await inspectKnownTikTokOnboarding(
+        dialog,
+        fingerprint
+      ).catch(() => null);
+      if (inspection?.matches) {
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    await Promise.all(
+      dialogHandles.map((dialog) => dialog.dispose().catch(() => {}))
+    );
+  }
+}
+
+async function dismissKnownTikTokPrePublishOnboarding(
+  page,
+  { phase = "pre-caption", beforeFinalValidation } = {}
+) {
+  const dialogHandles = await page
+    .locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
+    .elementHandles();
+  const controlHandles = [];
+  let dismissAttempted = false;
+
+  try {
+    const visibleDialogs = [];
+    for (const dialog of dialogHandles) {
+      if (await dialog.isVisible().catch(() => false)) {
+        visibleDialogs.push(dialog);
+      }
+    }
+
+    if (visibleDialogs.length === 0) {
+      return {
+        blocked: false,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 0,
+      };
+    }
+
+    if (visibleDialogs.length !== 1) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: visibleDialogs.length,
+      };
+    }
+
+    const dialog = visibleDialogs[0];
+    const recognition = await recognizeKnownTikTokPrePublishOnboarding(dialog, {
+      phase,
+      requireOnlyVisibleDialog: true,
+    }).catch(() => null);
+    if (!recognition || recognition.inspection.buttonIndex < 0) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const { fingerprint, inspection } = recognition;
+    const controls = await dialog.$$("button, [role='button']");
+    controlHandles.push(...controls);
+    const button = controls[inspection.buttonIndex];
+    if (!button) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    console.log(fingerprint.detectedLog);
+
+    const actionable = await button
+      .click({ timeout: 3000, trial: true })
+      .then(() => true)
+      .catch(() => false);
+    if (!actionable) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    if (beforeFinalValidation) {
+      try {
+        await beforeFinalValidation();
+      } catch {
+        return {
+          blocked: true,
+          dismissed: false,
+          dismissAttempted: false,
+          visibleDialogCount: 1,
+        };
+      }
+    }
+
+    const finalValidation = await recognizeKnownTikTokPrePublishOnboarding(dialog, {
+      phase,
+      expectedButton: button,
+      requireOnlyVisibleDialog: true,
+    }).catch(() => null);
+    if (!finalValidation || finalValidation.fingerprint.id !== fingerprint.id) {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted: false,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const dismissGuard = createKnownOnboardingDismissGuard();
+    try {
+      dismissGuard.consume();
+      dismissAttempted = true;
+      await button.click({ timeout: 5000 });
+    } catch {
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted,
+        visibleDialogCount: 1,
+      };
+    }
+
+    const disappeared = await dialog
+      .waitForElementState("hidden", { timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    const remainingOverlayState = await detectInterferingOverlays(page);
+    if (!disappeared || remainingOverlayState.blocked) {
+      if (
+        disappeared &&
+        fingerprint.reappearedLog &&
+        (await hasVisibleKnownTikTokOnboarding(page, fingerprint))
+      ) {
+        console.log(fingerprint.reappearedLog);
+      }
+      return {
+        blocked: true,
+        dismissed: false,
+        dismissAttempted,
+        visibleDialogCount: remainingOverlayState.visibleDialogCount,
+      };
+    }
+
+    console.log(fingerprint.dismissedLog);
+    return {
+      blocked: false,
+      dismissed: true,
+      dismissAttempted,
+      onboardingId: fingerprint.id,
+      visibleDialogCount: 0,
+    };
+  } finally {
+    await Promise.all(
+      controlHandles.map((control) => control.dispose().catch(() => {}))
+    );
+    await Promise.all(
+      dialogHandles.map((dialog) => dialog.dispose().catch(() => {}))
+    );
+  }
+}
+
+async function dismissKnownTikTokEditorOnboarding(page, options = {}) {
+  return dismissKnownTikTokPrePublishOnboarding(page, options);
+}
+
+function classifyPublishCandidateInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const reject = (reason) => ({
+    qualified: false,
+    reasons: [reason],
+    score: -1,
+  });
   const visibleText = normalizeUiText(info?.text);
   const ariaLabel = normalizeUiText(info?.ariaLabel);
   const text = visibleText || ariaLabel;
-  if (
-    !text ||
-    info?.disabled ||
-    info?.inNavigation ||
-    !info?.structuralBinding
-  ) {
-    return -1;
-  }
+  if (!info) return reject("candidate-info-unavailable");
+  if (info.visible === false) return reject("invisible");
+  if (!text) return reject("missing-label");
+  if (info.disabled) return reject("disabled");
+  if (info.inNavigation) return reject("inside-navigation");
+  if (!info.structuralBinding) return reject("structural-binding-missing");
 
   const tagName = normalizeUiText(info?.tagName);
   const role = normalizeUiText(info?.role);
   if (!["button", "a"].includes(tagName) && role !== "button") {
-    return -1;
+    return reject("non-semantic-clickable");
   }
 
   const href = normalizeUiText(info?.href);
   if (href && /\/(post|posts|analytics|comment|home|inspiration|monetization|academy|sound|feedback)(\/|$|\?)/i.test(href)) {
-    return -1;
+    return reject("navigation-href");
   }
 
   if (text === "posts") {
-    return -1;
+    return reject("posts-label");
   }
 
   const labels = new Set(publishTerms.map(normalizeUiText).filter(Boolean));
   const identities = new Set([visibleText, ariaLabel].filter(Boolean));
-  if (identities.size !== 1 || !labels.has([...identities][0])) {
-    return -1;
-  }
+  if (identities.size !== 1) return reject("text-aria-mismatch");
+  if (!labels.has([...identities][0])) return reject("label-not-allowlisted");
 
   const rect = info?.rect || {};
   const viewportWidth = Number(info?.viewportWidth) || 0;
@@ -172,7 +1173,7 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   const mainContentBoundary = viewportWidth >= 900 ? Math.min(300, viewportWidth * 0.25) : 0;
 
   if (viewportWidth >= 900 && right <= mainContentBoundary) {
-    return -1;
+    return reject("left-of-main-content");
   }
 
   const isBottomAction = viewportHeight > 0 && top >= viewportHeight * 0.5;
@@ -181,7 +1182,7 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   const hasPublishCue = /\b(post|publish|submit)\b/.test(className);
 
   if (text === "post" && viewportHeight >= 600 && !isBottomAction && !hasPublishCue) {
-    return -1;
+    return reject("post-outside-bottom-action-without-class-cue");
   }
 
   let score = 0;
@@ -194,7 +1195,15 @@ function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPub
   if (viewportWidth >= 900 && left >= mainContentBoundary) score += 20;
   score += Math.min(20, Math.max(0, top / 40));
 
-  return score;
+  return {
+    qualified: true,
+    reasons: ["qualified"],
+    score,
+  };
+}
+
+function getPublishCandidateScore(info, publishTerms = uiLabels.terms("tiktokPublish")) {
+  return classifyPublishCandidateInfo(info, publishTerms).score;
 }
 
 function isLikelyPublishCandidateInfo(info, publishTerms = uiLabels.terms("tiktokPublish")) {
@@ -208,6 +1217,7 @@ async function getPublishCandidateInfo(
   return candidate.evaluate((el, boundaryOptions) => {
     const clickable = el.closest("button, [role='button'], a") || el;
     const rect = clickable.getBoundingClientRect();
+    const style = window.getComputedStyle(clickable);
     const className = (clickable.className || "").toString();
     const dataAttributes = Array.from(clickable.attributes || [])
       .filter((attr) => attr.name.startsWith("data-"))
@@ -238,11 +1248,22 @@ async function getPublishCandidateInfo(
       )
     );
     const anchor = clickable.closest("a");
+    const nearestButtonOwner = el.closest("button, [role='button']");
+    const sidebarAncestorSelector = [
+      "[class*='sidebar' i]",
+      "[class*='side-bar' i]",
+      "[class*='sidenav' i]",
+      "[class*='side-nav' i]",
+      "[class*='side_nav' i]",
+      "[data-e2e*='side' i]",
+      "[data-testid*='side' i]",
+    ].join(", ");
     const blockedStructuralAncestorSelector = [
       "nav",
       "aside",
       "[role='navigation']",
       "[role='dialog']",
+      "[role='alertdialog']",
       "[aria-modal='true']",
     ].join(", ");
     let structuralBinding = "";
@@ -266,13 +1287,136 @@ async function getPublishCandidateInfo(
       }
     }
 
+    const actionRegion = clickable.parentElement;
+    const actionFooter = actionRegion?.parentElement || null;
+    const actionRegionPosts = actionRegion
+      ? Array.from(
+          actionRegion.querySelectorAll('[data-e2e="post_video_button"]')
+        )
+      : [];
+    const actionRegionDiscards = actionRegion
+      ? Array.from(
+          actionRegion.querySelectorAll('[data-e2e="discard_post_button"]')
+        )
+      : [];
+    const discardOwner =
+      actionRegionDiscards.length === 1 ? actionRegionDiscards[0] : null;
+    const hasVerifiedUploadActionRegion =
+      window.location.origin === "https://www.tiktok.com" &&
+      /^\/tiktokstudio\/upload\/?$/i.test(window.location.pathname) &&
+      clickable.tagName === "BUTTON" &&
+      clickable.getAttribute("role") === "button" &&
+      clickable.getAttribute("type") === "button" &&
+      clickable.getAttribute("data-e2e") === "post_video_button" &&
+      clickable.getAttribute("data-icon-only") === "false" &&
+      clickable.getAttribute("data-size") === "large" &&
+      clickable.getAttribute("data-disabled") === "false" &&
+      actionRegion?.classList.contains("button-group") &&
+      Boolean(
+        actionFooter &&
+          (actionFooter.tagName === "FOOTER" ||
+            actionFooter.classList.contains("footer"))
+      ) &&
+      actionRegionPosts.length === 1 &&
+      actionRegionPosts[0] === clickable &&
+      discardOwner?.matches("button, [role='button']") &&
+      !discardOwner.disabled &&
+      discardOwner.getAttribute("aria-disabled") !== "true" &&
+      !actionRegion.closest(blockedStructuralAncestorSelector);
+
+    if (hasVerifiedUploadActionRegion) {
+      structuralBinding = "verified-upload-action-region";
+    }
+
+    const describeAncestor = (element, depth) => ({
+      className: (element.className || "").toString(),
+      dataE2e: element.getAttribute("data-e2e") || "",
+      dataTestId: element.getAttribute("data-testid") || "",
+      depth,
+      id: element.id || "",
+      populatedFileInputCount: Array.from(
+        element.querySelectorAll('input[type="file"]')
+      ).filter(
+        (input) =>
+          input.isConnected &&
+          !input.disabled &&
+          input.files &&
+          input.files.length > 0
+      ).length,
+      role: element.getAttribute("role") || "",
+      tagName: element.tagName,
+    });
+    const ancestorChain = [];
+    let currentAncestor = clickable.parentElement;
+    for (
+      let depth = 1;
+      currentAncestor && depth <= 12;
+      depth += 1, currentAncestor = currentAncestor.parentElement
+    ) {
+      ancestorChain.push(describeAncestor(currentAncestor, depth));
+    }
+    const documentPopulatedFileInputCount = Array.from(
+      document.querySelectorAll('input[type="file"]')
+    ).filter(
+      (input) =>
+        input.isConnected &&
+        !input.disabled &&
+        input.files &&
+        input.files.length > 0
+    ).length;
+
     const info = {
+      ancestorChain,
       ariaLabel: clickable.getAttribute("aria-label") || "",
+      ariaDisabled: clickable.getAttribute("aria-disabled") || "",
+      ancestorAside: Boolean(clickable.closest("aside")),
+      ancestorDialog: Boolean(
+        clickable.closest(
+          '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+        )
+      ),
+      ancestorForm: Boolean(structuralRoot),
+      ancestorMain: Boolean(clickable.closest("main, [role='main']")),
+      ancestorMenu: Boolean(
+        clickable.closest("[role='menu'], [role='menubar']")
+      ),
+      ancestorNav: Boolean(clickable.closest("nav")),
+      ancestorNavigation: Boolean(clickable.closest("[role='navigation']")),
+      ancestorSection: Boolean(clickable.closest("section")),
+      ancestorSidebar: Boolean(clickable.closest(sidebarAncestorSelector)),
+      actionRegion: actionRegion
+        ? {
+            className: (actionRegion.className || "").toString(),
+            discardCount: actionRegionDiscards.length,
+            footerClassName: (actionFooter?.className || "").toString(),
+            footerTagName: actionFooter?.tagName || "",
+            postCount: actionRegionPosts.length,
+          }
+        : null,
       className,
+      dataDisabled: clickable.getAttribute("data-disabled") || "",
+      dataE2e: clickable.getAttribute("data-e2e") || "",
+      dataIconOnly: clickable.getAttribute("data-icon-only") || "",
+      dataSize: clickable.getAttribute("data-size") || "",
       dataAttributes,
+      dataTestId: clickable.getAttribute("data-testid") || "",
       disabled: Boolean(clickable.disabled) || clickable.getAttribute("aria-disabled") === "true",
+      documentPopulatedFileInputCount,
+      formAction: structuralRoot?.getAttribute("action") || "",
       href: anchor ? anchor.getAttribute("href") || "" : "",
+      id: clickable.id || "",
       inNavigation,
+      nearestButtonOwner: nearestButtonOwner
+        ? {
+            ariaLabel: nearestButtonOwner.getAttribute("aria-label") || "",
+            id: nearestButtonOwner.id || "",
+            role: nearestButtonOwner.getAttribute("role") || "",
+            tagName: nearestButtonOwner.tagName,
+            text: nearestButtonOwner.textContent || "",
+          }
+        : null,
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
       rect: {
         left: rect.left,
         right: rect.right,
@@ -286,6 +1430,12 @@ async function getPublishCandidateInfo(
       tagName: clickable.tagName,
       type: clickable.getAttribute("type") || "",
       text: clickable.textContent || "",
+      visible:
+        clickable.isConnected &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0,
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
@@ -294,8 +1444,48 @@ async function getPublishCandidateInfo(
       return info;
     }
 
+    const readinessFingerprint = boundaryOptions.readinessFingerprint;
+    const normalizeReadinessText = (value) =>
+      String(value || "").trim().replace(/\s+/g, " ");
+    const isVisibleReadinessElement = (element) => {
+      if (!element?.isConnected) return false;
+      const elementStyle = window.getComputedStyle(element);
+      const elementRect = element.getBoundingClientRect();
+      return (
+        elementStyle.display !== "none" &&
+        elementStyle.visibility !== "hidden" &&
+        elementRect.width > 0 &&
+        elementRect.height > 0
+      );
+    };
+    const exactVisibleReadinessAnchors = (selector, title) =>
+      Array.from(document.querySelectorAll(selector)).filter(
+        (element) =>
+          isVisibleReadinessElement(element) &&
+          normalizeReadinessText(element.innerText) === title
+      );
+    const getReadinessStatusText = (section, title) => {
+      const text = normalizeReadinessText(section?.innerText);
+      const prefix = `${title} `;
+      return text.startsWith(prefix) ? text.slice(prefix.length) : "";
+    };
+    const musicAnchors = exactVisibleReadinessAnchors(
+      readinessFingerprint.music.selector,
+      readinessFingerprint.music.title
+    );
+    const contentAnchors = exactVisibleReadinessAnchors(
+      readinessFingerprint.content.selector,
+      readinessFingerprint.content.title
+    );
+    const musicSection =
+      musicAnchors.length === 1 ? musicAnchors[0].parentElement : null;
+    const contentSection =
+      contentAnchors.length === 1 ? contentAnchors[0].parentElement : null;
+
     const visibleDialogCount = Array.from(
-      document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+      document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+      )
     ).filter((dialog) => {
       const style = window.getComputedStyle(dialog);
       const rect = dialog.getBoundingClientRect();
@@ -307,15 +1497,49 @@ async function getPublishCandidateInfo(
         rect.height > 0
       );
     }).length;
+    const uploadPendingVisible = Array.from(
+      document.querySelectorAll("body *")
+    ).some(
+      (element) =>
+        isVisibleReadinessElement(element) &&
+        normalizeReadinessText(element.innerText) ===
+          readinessFingerprint.uploadPendingText
+    );
+    const publishReadinessInfo = {
+      contentAnchorCount: contentAnchors.length,
+      contentStatusText: getReadinessStatusText(
+        contentSection,
+        readinessFingerprint.content.title
+      ),
+      musicAnchorCount: musicAnchors.length,
+      musicStatusText: getReadinessStatusText(
+        musicSection,
+        readinessFingerprint.music.title
+      ),
+      pageOrigin: window.location.origin,
+      pagePath: window.location.pathname,
+      sameCheckRegion: Boolean(
+        musicSection &&
+          contentSection &&
+          musicSection.parentElement === contentSection.parentElement
+      ),
+      uploadPendingVisible,
+      visibleDialogCount,
+    };
 
     return {
       ...info,
       finalBoundary: {
+        publishReadinessInfo,
         sameOwner: clickable === boundaryOptions.originallySelected,
         visibleDialogCount,
       },
     };
-  }, { inspectFinalBoundary, originallySelected });
+  }, {
+    inspectFinalBoundary,
+    originallySelected,
+    readinessFingerprint: TIKTOK_PUBLISH_READINESS,
+  });
 }
 
 async function getCanonicalPublishOwner(candidate) {
@@ -352,10 +1576,253 @@ function getPublishCandidateLocators(page) {
   ];
 }
 
+function isPublishDiagnosticCandidateInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const labels = publishTerms.map(normalizeUiText).filter(Boolean);
+  const evidence = normalizeUiText(
+    [
+      info?.text,
+      info?.ariaLabel,
+      info?.className,
+      info?.dataAttributes,
+      info?.dataE2e,
+      info?.dataTestId,
+    ].join(" ")
+  );
+  return (
+    normalizeUiText(info?.type) === "submit" ||
+    labels.some((label) => evidence.includes(label)) ||
+    /\b(posts?|publish|submit)\b/.test(evidence)
+  );
+}
+
+async function collectPublishCandidateDiagnostics(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const owners = [];
+  const locatorSources = ["exact-role", "semantic-clickable"];
+
+  try {
+    const locators = getPublishCandidateLocators(page);
+    for (let locatorIndex = 0; locatorIndex < locators.length; locatorIndex += 1) {
+      const locator = locators[locatorIndex];
+      const total = await locator.count();
+      for (let candidateIndex = 0; candidateIndex < total; candidateIndex += 1) {
+        const handle = await getCanonicalPublishOwner(locator.nth(candidateIndex));
+        if (!handle) continue;
+
+        let duplicate = null;
+        for (const owner of owners) {
+          const sameOwner = await handle
+            .evaluate((element, other) => element === other, owner.handle)
+            .catch(() => false);
+          if (sameOwner) {
+            duplicate = owner;
+            break;
+          }
+        }
+
+        if (duplicate) {
+          duplicate.locatorSources.add(locatorSources[locatorIndex]);
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+
+        const info = await getPublishCandidateInfo(handle).catch(() => null);
+        if (!isPublishDiagnosticCandidateInfo(info, publishTerms)) {
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+        owners.push({
+          handle,
+          info,
+          locatorSources: new Set([locatorSources[locatorIndex]]),
+        });
+      }
+    }
+
+    const classified = owners.map((owner) => ({
+      ...owner,
+      classification: classifyPublishCandidateInfo(owner.info, publishTerms),
+    }));
+    const qualifiedTargetCount = classified.filter(
+      ({ classification }) => classification.qualified
+    ).length;
+
+    return {
+      candidateCount: classified.length,
+      qualifiedTargetCount,
+      candidates: classified.map((entry, index) => {
+        const ambiguous =
+          entry.classification.qualified && qualifiedTargetCount !== 1;
+        return {
+          index,
+          status:
+            entry.classification.qualified && !ambiguous
+              ? "ACCEPTED"
+              : "REJECTED",
+          reasons: ambiguous
+            ? ["ambiguous-qualified-duplicate"]
+            : entry.classification.reasons,
+          score: entry.classification.score,
+          locatorSources: [...entry.locatorSources],
+          ...entry.info,
+        };
+      }),
+    };
+  } finally {
+    await Promise.all(owners.map(({ handle }) => handle.dispose().catch(() => {})));
+  }
+}
+
 async function disposePublishTargets(targets) {
   await Promise.all(
     targets.map(({ handle }) => handle.dispose().catch(() => {}))
   );
+}
+
+function classifyTikTokPublishPreparationInfo(
+  info,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const reject = (reason) => ({ qualified: false, reason });
+  if (!classifyPublishCandidateInfo(info, publishTerms).qualified) {
+    return reject("publish-candidate-qualification-failed");
+  }
+  if (
+    info.pageOrigin !== TIKTOK_PUBLISH_READINESS.origin ||
+    !/^\/tiktokstudio\/upload\/?$/i.test(info.pagePath || "")
+  ) {
+    return reject("studio-upload-page-mismatch");
+  }
+  if (
+    info.tagName !== "BUTTON" ||
+    normalizeUiText(info.role) !== "button" ||
+    normalizeUiText(info.type) !== "button"
+  ) {
+    return reject("button-semantics-mismatch");
+  }
+  if (
+    info.dataE2e !== "post_video_button" ||
+    info.dataIconOnly !== "false" ||
+    info.dataSize !== "large" ||
+    info.dataDisabled !== "false" ||
+    info.disabled === true
+  ) {
+    return reject("publish-button-attributes-mismatch");
+  }
+  if (
+    info.inNavigation ||
+    info.ancestorAside ||
+    info.ancestorDialog ||
+    info.ancestorMenu ||
+    info.ancestorNav ||
+    info.ancestorNavigation ||
+    info.ancestorSidebar
+  ) {
+    return reject("blocked-structural-ancestor");
+  }
+  if (
+    info.structuralBinding !== "verified-upload-action-region" ||
+    !info.actionRegion ||
+    !normalizeUiText(info.actionRegion.className)
+      .split(/\s+/)
+      .includes("button-group") ||
+    info.actionRegion.postCount !== 1 ||
+    info.actionRegion.discardCount !== 1 ||
+    !(
+      info.actionRegion.footerTagName === "FOOTER" ||
+      normalizeUiText(info.actionRegion.footerClassName)
+        .split(/\s+/)
+        .includes("footer")
+    )
+  ) {
+    return reject("verified-upload-action-region-mismatch");
+  }
+  return { qualified: true, reason: "qualified" };
+}
+
+async function prepareTikTokPublishTargetForQualification(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const candidates = [];
+
+  try {
+    const locator = page.locator('[data-e2e="post_video_button"]');
+    const total = await locator.count();
+    for (let index = 0; index < total; index += 1) {
+      const handle = await getCanonicalPublishOwner(locator.nth(index));
+      if (!handle) {
+        continue;
+      }
+
+      let duplicate = false;
+      for (const candidate of candidates) {
+        const sameOwner = await handle
+          .evaluate((element, other) => element === other, candidate.handle)
+          .catch(() => false);
+        if (sameOwner) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) {
+        await handle.dispose().catch(() => {});
+        continue;
+      }
+
+      const info = await getPublishCandidateInfo(handle).catch(() => null);
+      const classification = classifyTikTokPublishPreparationInfo(
+        info,
+        publishTerms
+      );
+      candidates.push({ handle, info, classification });
+    }
+
+    const qualified = candidates.filter(
+      ({ classification }) => classification.qualified
+    );
+    if (qualified.length !== 1) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "Could not safely prepare the TikTok Publish/Post button: " +
+          `expected exactly one structurally verified target, observed ${qualified.length}.`,
+      };
+    }
+
+    try {
+      await qualified[0].handle.scrollIntoViewIfNeeded({ timeout: 3000 });
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "Could not reveal the structurally verified TikTok Publish/Post " +
+          `button before qualification: ${error.message}`,
+      };
+    }
+
+    return {
+      ok: true,
+      outcome: "prepared",
+      retryAllowed: true,
+      clickAttempted: false,
+    };
+  } finally {
+    await Promise.all(
+      candidates.map(({ handle }) => handle.dispose().catch(() => {}))
+    );
+  }
 }
 
 async function collectUniquePublishTargets(
@@ -425,6 +1892,162 @@ async function collectUniquePublishTargets(
   } catch (error) {
     await disposePublishTargets(targets);
     throw error;
+  }
+}
+
+async function collectTikTokPublishTargetResolutionDiagnostics(
+  page,
+  publishTerms = uiLabels.terms("tiktokPublish")
+) {
+  const directLocator = page.locator('[data-e2e="post_video_button"]');
+  const [publishRoleLocator, semanticClickableLocator] =
+    getPublishCandidateLocators(page);
+  const ownerHandles = [];
+  const candidateOwners = [];
+  let finalTargets = [];
+  const errors = [];
+
+  const safeCount = async (locator, field) => {
+    try {
+      return await locator.count();
+    } catch (error) {
+      errors.push({ field, error: error.message });
+      return null;
+    }
+  };
+
+  const directPostCount = await safeCount(directLocator, "directPostCount");
+  const publishRoleCount = await safeCount(
+    publishRoleLocator,
+    "publishRoleCount"
+  );
+  const semanticClickableCount = await safeCount(
+    semanticClickableLocator,
+    "semanticClickableCount"
+  );
+  const targets = [];
+
+  try {
+    for (let index = 0; index < (directPostCount || 0); index += 1) {
+      const locator = directLocator.nth(index);
+      let playwrightVisible = null;
+      let playwrightVisibilityError = "";
+      try {
+        playwrightVisible = await locator.isVisible();
+      } catch (error) {
+        playwrightVisibilityError = error.message;
+      }
+
+      const owner = await getCanonicalPublishOwner(locator);
+      candidateOwners.push(owner);
+      if (owner) {
+        ownerHandles.push(owner);
+      }
+
+      let info = null;
+      let candidateInfoError = "";
+      if (owner) {
+        try {
+          info = await getPublishCandidateInfo(owner);
+        } catch (error) {
+          candidateInfoError = error.message;
+        }
+      }
+
+      const classification = classifyPublishCandidateInfo(info, publishTerms);
+      const preparationClassification =
+        classifyTikTokPublishPreparationInfo(info, publishTerms);
+      targets.push({
+        physicalIndex: index,
+        playwrightVisible,
+        playwrightVisibilityError: playwrightVisibilityError || undefined,
+        canonicalOwnerObtained: Boolean(owner),
+        candidateInfoAvailable: Boolean(info),
+        candidateInfoError: candidateInfoError || undefined,
+        classification: {
+          qualified: classification.qualified,
+          reasons: classification.reasons,
+          score: classification.score,
+        },
+        preparationClassification: {
+          qualified: preparationClassification.qualified,
+          reason: preparationClassification.reason,
+        },
+        normalizedText: normalizeUiText(info?.text),
+        normalizedAriaLabel: normalizeUiText(info?.ariaLabel),
+        tagName: info?.tagName || "",
+        role: info?.role || "",
+        type: info?.type || "",
+        dataE2e: info?.dataE2e || "",
+        dataIconOnly: info?.dataIconOnly || "",
+        dataSize: info?.dataSize || "",
+        dataDisabled: info?.dataDisabled || "",
+        disabled: info?.disabled ?? null,
+        infoVisible: info?.visible ?? null,
+        rect: info?.rect || null,
+        viewportWidth: info?.viewportWidth ?? null,
+        viewportHeight: info?.viewportHeight ?? null,
+        structuralBinding: info?.structuralBinding || "",
+        actionRegion: info?.actionRegion
+          ? {
+              className: info.actionRegion.className,
+              postCount: info.actionRegion.postCount,
+              discardCount: info.actionRegion.discardCount,
+              footerTagName: info.actionRegion.footerTagName,
+              footerClassName: info.actionRegion.footerClassName,
+            }
+          : null,
+        ancestors: {
+          inNavigation: info?.inNavigation ?? null,
+          nav: info?.ancestorNav ?? null,
+          navigation: info?.ancestorNavigation ?? null,
+          sidebar: info?.ancestorSidebar ?? null,
+          aside: info?.ancestorAside ?? null,
+          dialog: info?.ancestorDialog ?? null,
+          menu: info?.ancestorMenu ?? null,
+        },
+        pageOrigin: info?.pageOrigin || "",
+        pagePath: info?.pagePath || "",
+        reachedFinalTargets: false,
+      });
+    }
+
+    try {
+      finalTargets = await collectUniquePublishTargets(page, publishTerms);
+    } catch (error) {
+      errors.push({ field: "finalTargetCount", error: error.message });
+    }
+
+    for (let index = 0; index < targets.length; index += 1) {
+      const owner = candidateOwners[index];
+      if (!owner) {
+        continue;
+      }
+      for (const finalTarget of finalTargets) {
+        const sameOwner = await owner
+          .evaluate((element, other) => element === other, finalTarget.handle)
+          .catch(() => false);
+        if (sameOwner) {
+          targets[index].reachedFinalTargets = true;
+          break;
+        }
+      }
+    }
+
+    return {
+      schemaVersion: 1,
+      directPostCount,
+      publishRoleCount,
+      semanticClickableCount,
+      finalTargetCount: finalTargets.length,
+      targets,
+      errors,
+    };
+  } finally {
+    await Promise.all(
+      ownerHandles.map((handle) => handle.dispose().catch(() => {}))
+    );
+    await disposePublishTargets(finalTargets);
   }
 }
 
@@ -824,7 +2447,9 @@ async function disableShortContentCheck(page) {
 }
 
 async function detectInterferingOverlays(page) {
-  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const dialogs = page.locator(
+    '[role="dialog"], [role="alertdialog"], [aria-modal="true"]'
+  );
   const dialogCount = await dialogs.count();
   let visibleDialogCount = 0;
 
@@ -876,11 +2501,29 @@ async function findUniquePublishTarget(
     }
   }
 
+  const diagnostics = await collectTikTokPublishTargetResolutionDiagnostics(
+    page
+  ).catch((error) => ({
+    schemaVersion: 1,
+    directPostCount: null,
+    publishRoleCount: null,
+    semanticClickableCount: null,
+    finalTargetCount: null,
+    targets: [],
+    errors: [{ field: "diagnosticCollection", error: error.message }],
+  }));
+  console.log(
+    `TikTok publish target resolution diagnostics: ${JSON.stringify(
+      diagnostics
+    )}`
+  );
+
   return {
     status: "none",
     count: 0,
     reason:
       "Could not find exactly one enabled TikTok Publish/Post button before any click.",
+    diagnostics,
   };
 }
 
@@ -894,6 +2537,9 @@ async function clickPublishOnce(
     beforeClick,
     publishResponseTracker,
     operationId,
+    expectedCaption,
+    expectedOperationBinding,
+    resolveExpectedOperationBinding,
   } = {}
 ) {
   const overlayState = await detectInterferingOverlays(page);
@@ -908,7 +2554,10 @@ async function clickPublishOnce(
         "automatic dialog interaction is disabled.",
     };
   }
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  const preparation = await prepareTikTokPublishTargetForQualification(page);
+  if (!preparation.ok) {
+    return preparation;
+  }
   await page.waitForTimeout(Math.max(0, Number(settleMs) || 0));
 
   const resolved = await findUniquePublishTarget(page, {
@@ -922,6 +2571,7 @@ async function clickPublishOnce(
       retryAllowed: true,
       clickAttempted: false,
       reason: resolved.reason,
+      ...(resolved.diagnostics ? { diagnostics: resolved.diagnostics } : {}),
     };
   }
 
@@ -929,31 +2579,12 @@ async function clickPublishOnce(
   let finalTarget = null;
   const actionGuard = createPublishActionGuard();
   try {
-    try {
-      await selectedTarget.handle.scrollIntoViewIfNeeded({ timeout: 3000 });
-    } catch (error) {
-      return {
-        ok: false,
-        outcome: "failure",
-        retryAllowed: true,
-        clickAttempted: false,
-        reason: `Could not prepare the TikTok Publish/Post button before click: ${error.message}`,
-      };
-    }
-
     if (beforeFinalValidation) {
       await beforeFinalValidation();
     }
 
     if (beforeClick) {
       await beforeClick();
-    }
-
-    if (
-      publishResponseTracker &&
-      typeof publishResponseTracker.beginClick === "function"
-    ) {
-      publishResponseTracker.beginClick(operationId);
     }
 
     const finalTargets = await collectUniquePublishTargets(page);
@@ -1002,6 +2633,22 @@ async function clickPublishOnce(
       };
     }
 
+    const finalReadiness = classifyTikTokPublishReadinessInfo(
+      finalBoundaryInfo.finalBoundary.publishReadinessInfo
+    );
+    if (finalReadiness.status !== "ready") {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish readiness changed immediately before click: " +
+          finalReadiness.reason,
+        evidence: finalReadiness.evidence,
+      };
+    }
+
     if (getPublishCandidateScore(finalBoundaryInfo) < 0) {
       return {
         ok: false,
@@ -1013,8 +2660,62 @@ async function clickPublishOnce(
       };
     }
 
+    const finalBindingResolution = resolveFinalPublishOperationBinding(
+      expectedOperationBinding,
+      resolveExpectedOperationBinding
+    );
+    if (!finalBindingResolution.ok) {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish operation binding was not uniquely established " +
+          "at the final Publish/Post action boundary.",
+        evidence: {
+          type: "pre-publish-operation-binding",
+          reasonCode: finalBindingResolution.reasonCode,
+        },
+      };
+    }
+    try {
+      if (
+        publishResponseTracker &&
+        typeof publishResponseTracker.arm === "function"
+      ) {
+        publishResponseTracker.arm({
+          expectedCaption,
+          expectedOperationBinding: finalBindingResolution.binding,
+        });
+      }
+    } catch {
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          "TikTok publish response tracking could not be armed at the " +
+          "final action boundary.",
+      };
+    }
+
     try {
       actionGuard.consume();
+      if (
+        publishResponseTracker &&
+        typeof publishResponseTracker.beginClick === "function"
+      ) {
+        publishResponseTracker.beginClick(operationId, {
+          activeComposerMatched:
+            finalBoundaryInfo.documentPopulatedFileInputCount === 1 &&
+            [
+              "active-upload-form",
+              "verified-upload-action-region",
+            ].includes(finalBoundaryInfo.structuralBinding),
+        });
+      }
       await finalTarget.handle.click({ timeout: 5000 });
     } catch (error) {
       return {
@@ -1133,14 +2834,479 @@ function isLikelyPublishApiResponse(response, expectedOrigin) {
   );
 }
 
+function getSafeHttpEvidenceUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "unavailable";
+  }
+}
+
+function normalizePublishedPostId(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return /^\d{8,32}$/.test(normalized) ? normalized : null;
+}
+
+const PUBLISH_BUSINESS_STATUS_RULES = new Map([
+  ["code", new Set([0, "0"])],
+  ["status_code", new Set([0, "0"])],
+  ["statusCode", new Set([0, "0"])],
+  ["success", new Set([true])],
+]);
+
+const PUBLISH_OPERATION_BINDING_KEYS = new Map([
+  ["project_id", "project"],
+  ["projectId", "project"],
+  ["video_id", "video"],
+  ["videoId", "video"],
+  ["upload_id", "upload"],
+  ["uploadId", "upload"],
+]);
+
+const PRE_PUBLISH_VIDEO_BINDING_PATH =
+  /^\/tiktok\/v\d+\/creator\/content\/check\/create\/?$/i;
+
+function normalizePublishOperationBinding(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(normalized) ? normalized : null;
+}
+
+function normalizeExpectedPublishOperationBinding(binding) {
+  if (!binding || typeof binding !== "object") {
+    return null;
+  }
+  const kind = binding.kind;
+  const value = normalizePublishOperationBinding(binding.value);
+  if (!["project", "video", "upload"].includes(kind) || !value) {
+    return null;
+  }
+  return { kind, value };
+}
+
+function resolveFinalPublishOperationBinding(
+  expectedOperationBinding,
+  resolveExpectedOperationBinding
+) {
+  const fallbackBinding = normalizeExpectedPublishOperationBinding(
+    expectedOperationBinding
+  );
+  if (typeof resolveExpectedOperationBinding !== "function") {
+    return { ok: true, binding: fallbackBinding };
+  }
+
+  let bindingResolution;
+  try {
+    bindingResolution = resolveExpectedOperationBinding();
+  } catch {
+    return { ok: false, reasonCode: "binding-resolution-failed" };
+  }
+  if (
+    bindingResolution &&
+    typeof bindingResolution.then === "function"
+  ) {
+    return { ok: false, reasonCode: "async-binding-resolution-rejected" };
+  }
+
+  const binding = normalizeExpectedPublishOperationBinding(
+    bindingResolution?.binding
+  );
+  if (bindingResolution?.ok !== true || !binding) {
+    return {
+      ok: false,
+      reasonCode:
+        bindingResolution?.reasonCode || "invalid-operation-binding",
+    };
+  }
+  return { ok: true, binding };
+}
+
+function inspectPublishPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  let hasExplicitRootSuccess = false;
+  for (const [key, validValues] of PUBLISH_BUSINESS_STATUS_RULES) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) {
+      continue;
+    }
+    if (!validValues.has(payload[key])) {
+      return null;
+    }
+    hasExplicitRootSuccess = true;
+  }
+  if (!hasExplicitRootSuccess) {
+    return null;
+  }
+
+  const postIdKeys = new Set([
+    "post_id",
+    "postId",
+    "item_id",
+    "itemId",
+    "aweme_id",
+    "awemeId",
+  ]);
+  const postIds = new Set();
+  const operationBindings = new Map();
+  const seen = new WeakSet();
+  let visitedNodes = 0;
+  let invalidPayload = false;
+
+  const visit = (value, depth) => {
+    if (
+      invalidPayload ||
+      value === null ||
+      typeof value !== "object" ||
+      depth > 8
+    ) {
+      return;
+    }
+    if (seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    visitedNodes += 1;
+    if (visitedNodes > 1000) {
+      invalidPayload = true;
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+      const validBusinessValues = PUBLISH_BUSINESS_STATUS_RULES.get(key);
+      if (validBusinessValues && !validBusinessValues.has(entry)) {
+        invalidPayload = true;
+        return;
+      }
+
+      if (postIdKeys.has(key)) {
+        const postId = normalizePublishedPostId(entry);
+        if (postId) {
+          postIds.add(postId);
+        }
+      }
+
+      const bindingKind = PUBLISH_OPERATION_BINDING_KEYS.get(key);
+      if (bindingKind) {
+        const bindingValue = normalizePublishOperationBinding(entry);
+        if (bindingValue) {
+          const values = operationBindings.get(bindingKind) || new Set();
+          values.add(bindingValue);
+          operationBindings.set(bindingKind, values);
+        }
+      }
+      visit(entry, depth + 1);
+    }
+  };
+
+  visit(payload, 0);
+  if (invalidPayload || postIds.size !== 1) {
+    return null;
+  }
+  return {
+    postId: [...postIds][0],
+    operationBindings,
+  };
+}
+
+function getPublishRequestPayload(request) {
+  if (typeof request.postDataJSON === "function") {
+    try {
+      const payload = request.postDataJSON();
+      if (payload && typeof payload === "object") {
+        return payload;
+      }
+    } catch {
+      // Fall through to the raw request body.
+    }
+  }
+
+  const postData =
+    typeof request.postData === "function" ? request.postData() || "" : "";
+  if (!postData) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(postData);
+    if (payload && typeof payload === "object") {
+      return payload;
+    }
+  } catch {
+    // The request may use URL-encoded form data.
+  }
+
+  const formPayload = {};
+  for (const [key, value] of new URLSearchParams(postData)) {
+    if (Object.prototype.hasOwnProperty.call(formPayload, key)) {
+      return null;
+    }
+    formPayload[key] = value;
+  }
+  return Object.keys(formPayload).length > 0 ? formPayload : null;
+}
+
+function inspectPublishRequestPayload(payload, expectedCaption) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const bindingValues = new Map();
+  const seen = new WeakSet();
+  let expectedCaptionMatched = false;
+  let visitedNodes = 0;
+  let invalidPayload = false;
+
+  const visit = (value, depth) => {
+    if (
+      invalidPayload ||
+      value === null ||
+      typeof value !== "object" ||
+      depth > 8
+    ) {
+      return;
+    }
+    if (seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    visitedNodes += 1;
+    if (visitedNodes > 1000) {
+      invalidPayload = true;
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (
+        ["caption", "description"].includes(key) &&
+        typeof entry === "string" &&
+        entry === expectedCaption
+      ) {
+        expectedCaptionMatched = true;
+      }
+      const bindingKind = PUBLISH_OPERATION_BINDING_KEYS.get(key);
+      if (bindingKind) {
+        const bindingValue = normalizePublishOperationBinding(entry);
+        if (bindingValue) {
+          const values = bindingValues.get(bindingKind) || new Set();
+          values.add(bindingValue);
+          bindingValues.set(bindingKind, values);
+        }
+      }
+      visit(entry, depth + 1);
+    }
+  };
+
+  visit(payload, 0);
+  if (invalidPayload) {
+    return null;
+  }
+  return { bindingValues, expectedCaptionMatched };
+}
+
+function mergePublishOperationBindings(target, source) {
+  for (const [kind, values] of source || []) {
+    const targetValues = target.get(kind) || new Set();
+    for (const value of values) {
+      targetValues.add(value);
+    }
+    target.set(kind, targetValues);
+  }
+  return target;
+}
+
+function getPublishRequestOperationBindings(request, payload) {
+  const bindings = new Map();
+  try {
+    const parsedUrl = new URL(request.url());
+    for (const [key, entry] of parsedUrl.searchParams) {
+      const bindingKind = PUBLISH_OPERATION_BINDING_KEYS.get(key);
+      const bindingValue = normalizePublishOperationBinding(entry);
+      if (bindingKind && bindingValue) {
+        const values = bindings.get(bindingKind) || new Set();
+        values.add(bindingValue);
+        bindings.set(bindingKind, values);
+      }
+    }
+  } catch {
+    // The caller's transport classifier rejects unparseable URLs.
+  }
+
+  const payloadEvidence = inspectPublishRequestPayload(payload, null);
+  return mergePublishOperationBindings(
+    bindings,
+    payloadEvidence?.bindingValues
+  );
+}
+
+function isTrustedPrePublishVideoBindingRequest(page, request, expectedOrigin) {
+  try {
+    if (request.method().toUpperCase() !== "POST") {
+      return false;
+    }
+    const parsedUrl = new URL(request.url());
+    if (
+      !expectedOrigin ||
+      parsedUrl.origin !== expectedOrigin ||
+      !PRE_PUBLISH_VIDEO_BINDING_PATH.test(parsedUrl.pathname)
+    ) {
+      return false;
+    }
+    if (request.isNavigationRequest() !== false) {
+      return false;
+    }
+    if (!["fetch", "xhr"].includes(request.resourceType())) {
+      return false;
+    }
+    return request.frame() === page.mainFrame();
+  } catch {
+    return false;
+  }
+}
+
+function createPrePublishOperationBindingTracker(page) {
+  let armed = false;
+  let expectedOrigin = null;
+  let matchingRequestCount = 0;
+  let invalidRequestCount = 0;
+  let videoBindings = new Set();
+
+  const requestHandler = (request) => {
+    if (
+      !armed ||
+      !isTrustedPrePublishVideoBindingRequest(page, request, expectedOrigin)
+    ) {
+      return;
+    }
+    matchingRequestCount += 1;
+    const payload = getPublishRequestPayload(request);
+    const bindings = getPublishRequestOperationBindings(request, payload);
+    const values = bindings.get("video");
+    if (!values || values.size !== 1) {
+      invalidRequestCount += 1;
+      return;
+    }
+    videoBindings.add([...values][0]);
+  };
+
+  page.on("request", requestHandler);
+
+  return {
+    arm() {
+      expectedOrigin = getExpectedOrigin(page.url());
+      matchingRequestCount = 0;
+      invalidRequestCount = 0;
+      videoBindings = new Set();
+      armed = true;
+    },
+    resolve() {
+      if (!armed) {
+        return { ok: false, reasonCode: "binding-capture-not-armed" };
+      }
+      if (matchingRequestCount === 0) {
+        return { ok: false, reasonCode: "binding-not-observed" };
+      }
+      if (invalidRequestCount > 0) {
+        return { ok: false, reasonCode: "invalid-video-binding" };
+      }
+      if (videoBindings.size !== 1) {
+        return { ok: false, reasonCode: "ambiguous-video-binding" };
+      }
+      return {
+        ok: true,
+        binding: { kind: "video", value: [...videoBindings][0] },
+        matchingRequestCount,
+      };
+    },
+    dispose() {
+      armed = false;
+      page.off("request", requestHandler);
+    },
+  };
+}
+
+function matchPublishOperationBinding(
+  requestBindings,
+  responseBindings,
+  expectedBinding
+) {
+  if (
+    !requestBindings ||
+    !responseBindings ||
+    !hasExpectedPublishOperationBinding(requestBindings, expectedBinding)
+  ) {
+    return null;
+  }
+  const matchedKinds = [];
+  for (const [kind, requestValues] of requestBindings) {
+    const responseValues = responseBindings.get(kind);
+    if (!responseValues) {
+      continue;
+    }
+    if (
+      requestValues.size !== 1 ||
+      responseValues.size !== 1 ||
+      [...requestValues][0] !== [...responseValues][0]
+    ) {
+      return null;
+    }
+    matchedKinds.push(kind);
+  }
+  return {
+    kind:
+      matchedKinds.length > 0
+        ? matchedKinds.sort().join("+")
+        : expectedBinding.kind,
+    source:
+      matchedKinds.length > 0
+        ? "request-response-echo"
+        : "request-response-identity",
+  };
+}
+
+function hasExpectedPublishOperationBinding(bindings, expectedBinding) {
+  if (!bindings || !expectedBinding) {
+    return false;
+  }
+  const values = bindings.get(expectedBinding.kind);
+  return (
+    values?.size === 1 && [...values][0] === expectedBinding.value
+  );
+}
+
 function createPublishResponseTracker(page) {
   let armed = false;
   let clickStarted = false;
   let operationId = null;
+  let activeComposerMatched = false;
+  let expectedCaption = null;
+  let expectedOperationBinding = null;
   let expectedOrigin = null;
   let publishApiSuccess = null;
   let publishApiFailure = null;
-  let startedRequests = new WeakSet();
+  let startedRequests = new WeakMap();
+  let candidateRequestCount = 0;
+  let operationAmbiguous = false;
+  let generation = 0;
 
   const requestHandler = (request) => {
     if (!armed || !clickStarted) {
@@ -1151,7 +3317,33 @@ function createPublishResponseTracker(page) {
       url: () => request.url(),
     };
     if (isLikelyPublishApiResponse(candidate, expectedOrigin)) {
-      startedRequests.add(request);
+      candidateRequestCount += 1;
+      if (candidateRequestCount > 1) {
+        operationAmbiguous = true;
+        if (publishApiSuccess) {
+          publishApiSuccess = {
+            ...publishApiSuccess,
+            currentVideoMatched: false,
+            operationBindingMatched: false,
+            candidateRequestCount,
+          };
+        }
+      }
+      const payload = getPublishRequestPayload(request);
+      const requestEvidence = inspectPublishRequestPayload(
+        payload,
+        expectedCaption
+      );
+      const bindingValues = getPublishRequestOperationBindings(request, payload);
+      startedRequests.set(request, requestEvidence && {
+        ...requestEvidence,
+        bindingValues,
+        expectedOperationBindingMatched:
+          hasExpectedPublishOperationBinding(
+            bindingValues,
+            expectedOperationBinding
+          ),
+      });
     }
   };
 
@@ -1160,15 +3352,16 @@ function createPublishResponseTracker(page) {
       return;
     }
     const request = response.request();
+    const requestEvidence = startedRequests.get(request);
     if (
-      !startedRequests.has(request) ||
+      !requestEvidence ||
       !isLikelyPublishApiResponse(response, expectedOrigin)
     ) {
       return;
     }
 
     const status = response.status();
-    const url = response.url();
+    const url = getSafeHttpEvidenceUrl(response.url());
     const method = response.request().method().toUpperCase();
     const evidence = {
       type: "http",
@@ -1179,12 +3372,73 @@ function createPublishResponseTracker(page) {
       expectedOriginMatched: true,
       requestStartedAfterClick: true,
       responseCompletedAfterClick: true,
+      activeComposerMatched,
+      expectedCaptionMatched: requestEvidence.expectedCaptionMatched,
+      expectedOperationBindingMatched: false,
+      operationBindingMatched: false,
       currentVideoMatched: false,
+      candidateRequestCount,
     };
 
     if (status >= 200 && status < 300) {
       publishApiSuccess = evidence;
-      console.log(`Publish API success: ${method} ${status} ${url}`);
+      console.log(
+        `Publish API response observed: ${method} ${status} ${url}; ` +
+          "awaiting operation binding."
+      );
+      const responseGeneration = generation;
+      const responseOperationId = operationId;
+      Promise.resolve()
+        .then(() =>
+          typeof response.json === "function" ? response.json() : null
+        )
+        .then((payload) => {
+          if (
+            !armed ||
+            generation !== responseGeneration ||
+            operationId !== responseOperationId
+          ) {
+            return;
+          }
+          const inspectedPayload = inspectPublishPayload(payload);
+          const matchedOperationBinding = matchPublishOperationBinding(
+            requestEvidence.bindingValues,
+            inspectedPayload?.operationBindings,
+            expectedOperationBinding
+          );
+          const expectedOperationBindingMatched =
+            requestEvidence.expectedOperationBindingMatched &&
+            Boolean(matchedOperationBinding);
+          if (
+            !inspectedPayload ||
+            !matchedOperationBinding ||
+            !expectedOperationBindingMatched ||
+            operationAmbiguous ||
+            candidateRequestCount !== 1
+          ) {
+            return;
+          }
+          const currentVideoMatched =
+            activeComposerMatched && requestEvidence.expectedCaptionMatched;
+          publishApiSuccess = {
+            ...evidence,
+            postId: inspectedPayload.postId,
+            postIdSource: "response-body",
+            expectedOperationBindingMatched,
+            operationBindingMatched: true,
+            operationBindingKind: matchedOperationBinding.kind,
+            operationBindingSource: matchedOperationBinding.source,
+            currentVideoMatched,
+          };
+          if (currentVideoMatched && responseOperationId) {
+            console.log(
+              `Publish API response bound to operation: ${method} ${status} ${url}`
+            );
+          }
+        })
+        .catch(() => {
+          // A 2xx response without a parseable, unique post ID remains unbound.
+        });
       return;
     }
 
@@ -1201,23 +3455,41 @@ function createPublishResponseTracker(page) {
   page.on("response", responseHandler);
 
   return {
-    arm() {
+    arm({
+      expectedCaption: currentExpectedCaption,
+      expectedOperationBinding: currentExpectedOperationBinding,
+    } = {}) {
       expectedOrigin = getExpectedOrigin(page.url());
       publishApiSuccess = null;
       publishApiFailure = null;
-      startedRequests = new WeakSet();
+      startedRequests = new WeakMap();
+      candidateRequestCount = 0;
+      operationAmbiguous = false;
       clickStarted = false;
       operationId = null;
+      activeComposerMatched = false;
+      expectedCaption =
+        typeof currentExpectedCaption === "string" &&
+        currentExpectedCaption.length > 0
+          ? currentExpectedCaption
+          : null;
+      expectedOperationBinding = normalizeExpectedPublishOperationBinding(
+        currentExpectedOperationBinding
+      );
       armed = true;
+      generation += 1;
     },
-    beginClick(currentOperationId) {
+    beginClick(currentOperationId, { activeComposerMatched: matched } = {}) {
       if (!armed) {
         return;
       }
       operationId = currentOperationId || null;
+      activeComposerMatched = matched === true;
       clickStarted = true;
     },
     dispose() {
+      armed = false;
+      generation += 1;
       page.off("request", requestHandler);
       page.off("response", responseHandler);
     },
@@ -1234,14 +3506,25 @@ function isAuthoritativePublishEvidence(evidence) {
   return Boolean(
     evidence &&
       evidence.type === "http" &&
+      ["POST", "PUT", "PATCH"].includes(evidence.method) &&
+      Number.isInteger(evidence.status) &&
+      evidence.status >= 200 &&
+      evidence.status < 300 &&
       evidence.expectedOriginMatched === true &&
       evidence.requestStartedAfterClick === true &&
       evidence.responseCompletedAfterClick === true &&
+      evidence.activeComposerMatched === true &&
+      evidence.expectedCaptionMatched === true &&
+      evidence.expectedOperationBindingMatched === true &&
+      evidence.operationBindingMatched === true &&
+      typeof evidence.operationBindingKind === "string" &&
+      evidence.operationBindingKind.length > 0 &&
       evidence.currentVideoMatched === true &&
+      evidence.candidateRequestCount === 1 &&
       typeof evidence.operationId === "string" &&
       evidence.operationId.length > 0 &&
-      typeof evidence.postId === "string" &&
-      evidence.postId.length > 0
+      evidence.postIdSource === "response-body" &&
+      normalizePublishedPostId(evidence.postId) === evidence.postId
   );
 }
 
@@ -1475,7 +3758,13 @@ async function publishFailClosed(
     settleMs = 500,
     confirmationMaxPolls = 30,
     confirmationPollIntervalMs = 2000,
+    readinessMaxWaitMs = 12 * 60 * 1000,
+    readinessPollIntervalMs = 5000,
+    readinessStablePolls = 2,
     beforeFinalValidation,
+    expectedCaption,
+    expectedOperationBinding,
+    resolveExpectedOperationBinding,
   } = {}
 ) {
   const overlayState = await detectInterferingOverlays(page);
@@ -1502,6 +3791,15 @@ async function publishFailClosed(
     };
   }
 
+  const readiness = await waitForTikTokPublishReadiness(page, {
+    maxWaitMs: readinessMaxWaitMs,
+    pollIntervalMs: readinessPollIntervalMs,
+    requiredStablePolls: readinessStablePolls,
+  });
+  if (!readiness.ok) {
+    return readiness;
+  }
+
   const tracker = responseTracker || createPublishResponseTracker(page);
   const ownsTracker = !responseTracker;
   const operationId = crypto.randomUUID();
@@ -1517,12 +3815,12 @@ async function publishFailClosed(
         baselineSurfaces =
           await captureVisiblePublishConfirmationSurfaces(page);
         startedUrl = page.url();
-        if (typeof tracker.arm === "function") {
-          tracker.arm();
-        }
       },
       publishResponseTracker: tracker,
       operationId,
+      expectedCaption,
+      expectedOperationBinding,
+      resolveExpectedOperationBinding,
     });
     if (!clickResult.ok) {
       return clickResult;
@@ -1642,6 +3940,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
   const context = await openPersistentContext(accountId);
   const page = context.pages()[0] || (await context.newPage());
   let closeHoldMs = 0;
+  let operationBindingTracker = null;
   let publishResponseTracker = null;
 
   try {
@@ -1652,13 +3951,22 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       );
     }
     await gotoUploadPage(page);
-    await setVideoFile(page, absoluteVideoPath);
+    operationBindingTracker = createPrePublishOperationBindingTracker(page);
+    await setVideoFile(page, absoluteVideoPath, {
+      beforeAssignment: () => operationBindingTracker.arm(),
+    });
     await waitForUploadReady(page);
-    await setCaption(page, caption || config.defaultCaption);
+    const effectiveCaption = caption || config.defaultCaption;
+    await setCaption(page, effectiveCaption);
     publishResponseTracker = createPublishResponseTracker(page);
     const confirmation = await publishFailClosed(
       page,
-      publishResponseTracker
+      publishResponseTracker,
+      {
+        expectedCaption: effectiveCaption,
+        resolveExpectedOperationBinding: () =>
+          operationBindingTracker.resolve(),
+      }
     );
     if (!confirmation.ok) {
       const error = new Error(
@@ -1668,6 +3976,7 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
       error.retryAllowed = confirmation.retryAllowed;
       error.reason = confirmation.reason;
       error.evidence = confirmation.evidence;
+      error.diagnostics = confirmation.diagnostics;
       error.clickAttempted = confirmation.clickAttempted;
       throw error;
     }
@@ -1696,20 +4005,11 @@ async function uploadVideo({ videoPath, caption, source, accountId }) {
     );
     await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => { });
     closeHoldMs = Math.max(config.failureHoldMs, 0);
-    return {
-      ok: false,
-      outcome: error.outcome || "failure",
-      retryAllowed:
-        typeof error.retryAllowed === "boolean"
-          ? error.retryAllowed
-          : true,
-      error: error.message,
-      reason: error.reason || error.message,
-      evidence: error.evidence,
-      clickAttempted: error.clickAttempted,
-      screenshotPath,
-    };
+    return buildTikTokUploadFailureResult(error, screenshotPath);
   } finally {
+    if (operationBindingTracker) {
+      operationBindingTracker.dispose();
+    }
     if (publishResponseTracker) {
       publishResponseTracker.dispose();
     }
@@ -1725,19 +4025,34 @@ module.exports = {
   closeLoginSession,
   uploadVideo,
   _private: {
+    classifyPublishCandidateInfo,
+    classifyTikTokPublishPreparationInfo,
+    classifyTikTokPublishReadinessInfo,
+    buildTikTokUploadFailureResult,
     clickPublishOnce,
+    collectTikTokPublishTargetResolutionDiagnostics,
+    collectTikTokPublishReadinessInfo,
     collectUniquePublishTargets,
+    collectPublishCandidateDiagnostics,
+    createPrePublishOperationBindingTracker,
     createPublishActionGuard,
     createPublishResponseTracker,
     detectInterferingOverlays,
+    dismissKnownTikTokEditorOnboarding,
+    dismissKnownTikTokPrePublishOnboarding,
     findUniquePublishTarget,
+    getPublishClickAttempted,
     getPublishCandidateScore,
     getAllowlistedPublishNavigation,
     isLikelyPublishApiResponse,
     isAuthoritativePublishEvidence,
     isLikelyPublishCandidateInfo,
     publishFailClosed,
+    prepareTikTokPublishTargetForQualification,
+    resolveFinalPublishOperationBinding,
     setCaption,
+    setVideoFile,
+    waitForTikTokPublishReadiness,
     waitForPublishConfirmation,
   },
 };
