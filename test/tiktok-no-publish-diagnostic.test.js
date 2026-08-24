@@ -180,7 +180,7 @@ test("TikTok no-publish guard records only fingerprinted operation bindings", as
   const guard = await installNoPublishGuards(page, {
     isLikelyPublishRequest: () => false,
   });
-  guard.beginOperationBindingCapture();
+  guard.beginOperationBindingCapture("post-assignment");
 
   const request = {
     method: () => "POST",
@@ -193,7 +193,7 @@ test("TikTok no-publish guard records only fingerprinted operation bindings", as
     postData: () =>
       JSON.stringify({ upload_id: "must-not-be-persisted" }),
     url: () =>
-      "https://upload.tiktok.com/video/upload?project_id=secret-project-id&session_token=private-query-token",
+      "https://upload.tiktok.com/video/secret-path-id/upload?project_id=secret-project-id&session_token=private-query-token",
   };
   let continued = false;
   await routeHandler({
@@ -223,9 +223,14 @@ test("TikTok no-publish guard records only fingerprinted operation bindings", as
   assert.equal(continued, true);
   assert.equal(state.operationBindingCapture.observationCount, 1);
   assert.equal(state.operationBindingCapture.overflowCount, 0);
+  assert.equal(state.operationBindingCapture.captureOutcome, "matched-binding");
+  assert.equal(state.operationBindingCapture.candidateObservationCount, 0);
   const [observation] = state.operationBindingCapture.observations;
+  assert.equal(observation.phase, "post-assignment");
   assert.equal(observation.method, "POST");
-  assert.equal(observation.url, "https://upload.tiktok.com/video/upload");
+  assert.equal(observation.transportClass, "eligible-tiktok-operation");
+  assert.match(observation.endpointFingerprint, /^[0-9a-f]{64}$/);
+  assert.equal("url" in observation, false);
   assert.equal(observation.status, 200);
   assert.deepEqual(
     observation.requestBindings.map(({ kind }) => kind),
@@ -251,6 +256,7 @@ test("TikTok no-publish guard records only fingerprinted operation bindings", as
   for (const secret of [
     "secret-upload-id",
     "secret-project-id",
+    "secret-path-id",
     "server-video-id",
     "private caption",
     "private-token",
@@ -260,6 +266,387 @@ test("TikTok no-publish guard records only fingerprinted operation bindings", as
   ]) {
     assert.doesNotMatch(serialized, new RegExp(secret));
   }
+  await guard.dispose();
+});
+
+test("TikTok no-publish guard triages rejected transports without persisting secrets", async () => {
+  let routeHandler = null;
+  let responseHandler = null;
+  let candidateHeaderReadCount = 0;
+  let candidateBodyReadCount = 0;
+  const page = {
+    async addInitScript() {},
+    frames() {
+      return [this];
+    },
+    async evaluate() {
+      return { blockedClickCount: 0 };
+    },
+    async route(_pattern, handler) {
+      routeHandler = handler;
+    },
+    async unroute() {},
+    on(event, handler) {
+      if (event === "response") {
+        responseHandler = handler;
+      }
+    },
+    off() {},
+  };
+  const guard = await installNoPublishGuards(page, {
+    isLikelyPublishRequest: () => false,
+  });
+  guard.beginOperationBindingCapture("page-load");
+
+  const requests = [
+    {
+      method: () => "POST",
+      postDataJSON: () => ({ project_id: "private-project-id" }),
+      resourceType: () => "xhr",
+      isNavigationRequest: () => false,
+      frame: () => ({ parentFrame: () => ({}) }),
+      url: () =>
+        "https://secret-upload.example-cdn.test/private-secret-segment/123?token=private-query-token",
+    },
+    {
+      method: () => "POST",
+      postDataJSON: () => ({ upload_id: "private-upload-id" }),
+      resourceType: () => "fetch",
+      isNavigationRequest: () => false,
+      frame: () => ({ parentFrame: () => null }),
+      url: () => "https://www.tiktok.com/aweme/v1/create?token=private-token",
+    },
+    {
+      method: () => "POST",
+      postDataJSON: () => ({ video_id: "private-video-id" }),
+      resourceType: () => "private-resource-type",
+      isNavigationRequest: () => {
+        throw new Error("private-navigation-error");
+      },
+      frame: () => {
+        throw new Error("private-frame-error");
+      },
+      url: () => "not a url with private-path-token",
+    },
+    {
+      method: () => "POST",
+      postDataJSON: () => ({ event: "private-analytics-event" }),
+      url: () => "https://analytics.example.test/event",
+    },
+    {
+      method: () => "GET",
+      postDataJSON: () => null,
+      url: () => "https://upload.tiktok.com/video/upload",
+    },
+  ];
+
+  for (const request of requests) {
+    await routeHandler({
+      async abort() {
+        assert.fail("diagnostic candidates must not be blocked");
+      },
+      async continue() {},
+      request: () => request,
+    });
+    if (request !== requests[4]) {
+      responseHandler({
+        headers: async () => {
+          candidateHeaderReadCount += 1;
+          if (request === requests[0]) {
+            return {
+              "content-type": "application/json",
+              "content-length": "128",
+              "content-encoding": "gzip",
+            };
+          }
+          if (request === requests[1]) {
+            return { "content-type": "application/json" };
+          }
+          return {
+            "content-type": "application/json",
+            "content-length": String(2 * 1024 * 1024),
+          };
+        },
+        json: async () => {
+          candidateBodyReadCount += 1;
+          return {
+            data: request.postDataJSON(),
+            padding: "x".repeat(2 * 1024 * 1024),
+            token: "private-response-token",
+          };
+        },
+        request: () => request,
+        status: () => 200,
+      });
+    }
+  }
+
+  const state = await guard.getState();
+  const capture = state.operationBindingCapture;
+  assert.equal(
+    capture.captureOutcome,
+    "candidate-observed-non-authoritative"
+  );
+  assert.equal(capture.observationCount, 0);
+  assert.equal(capture.candidateObservationCount, 4);
+  assert.equal(capture.candidateOverflowCount, 0);
+  assert.equal(candidateHeaderReadCount, 0);
+  assert.equal(candidateBodyReadCount, 0);
+  assert.deepEqual(
+    capture.candidateObservations.map(({ rejectionReason }) => rejectionReason),
+    [
+      "origin-not-allowed",
+      "path-not-recognized",
+      "unparseable-url",
+      "origin-not-allowed",
+    ]
+  );
+  for (const candidate of capture.candidateObservations.slice(0, 3)) {
+    assert.equal(candidate.phase, "page-load");
+    assert.match(candidate.endpointFingerprint, /^[0-9a-f]{64}$/);
+    assert.equal("url" in candidate, false);
+    assert.equal(candidate.status, 200);
+    assert.equal(candidate.responseBodyClass, "candidate-metadata-only");
+    assert.equal(candidate.responseBindings.length, 0);
+    assert.equal(candidate.matchedBindings.length, 0);
+  }
+  assert.equal(
+    capture.candidateObservations[3].responseBodyClass,
+    "request-binding-missing"
+  );
+  assert.equal(capture.candidateObservations[3].matchedBindings.length, 0);
+  assert.deepEqual(capture.candidateObservations[0].transportMetadata, {
+    originClass: "cross-origin-other",
+    pathLengthClass: "1-31",
+    pathSegmentCountClass: "1-2",
+    pathShape: ["opaque", "numeric"],
+    pathShapeTruncated: false,
+    frameClass: "child-frame",
+    navigationClass: "non-navigation",
+    resourceTypeClass: "xhr",
+  });
+  assert.deepEqual(capture.candidateObservations[1].transportMetadata, {
+    originClass: "suffix-tiktok-com",
+    pathLengthClass: "1-31",
+    pathSegmentCountClass: "3-4",
+    pathShape: ["aweme", "version", "create"],
+    pathShapeTruncated: false,
+    frameClass: "main-frame",
+    navigationClass: "non-navigation",
+    resourceTypeClass: "fetch",
+  });
+  assert.deepEqual(capture.candidateObservations[2].transportMetadata, {
+    originClass: "unparseable",
+    pathLengthClass: "unavailable",
+    pathSegmentCountClass: "unavailable",
+    pathShape: ["unparseable"],
+    pathShapeTruncated: false,
+    frameClass: "worker-or-unavailable",
+    navigationClass: "unavailable",
+    resourceTypeClass: "unknown",
+  });
+  assert.deepEqual(capture.transportSummary, {
+    observedRequestCount: 5,
+    mutationRequestCount: 4,
+    eligibleRequestCount: 0,
+    ignoredMethodCount: 1,
+    rejectedOriginCount: 2,
+    rejectedPathCount: 1,
+    unparseableUrlCount: 1,
+    phaseCounts: {
+      "page-load": {
+        observedRequestCount: 5,
+        mutationRequestCount: 4,
+        eligibleRequestCount: 0,
+        candidateRequestCount: 4,
+      },
+    },
+  });
+
+  const serialized = JSON.stringify(state);
+  for (const secret of [
+    "secret-upload.example-cdn.test",
+    "private-project-id",
+    "private-upload-id",
+    "private-video-id",
+    "private-query-token",
+    "private-token",
+    "private-path-token",
+    "private-secret-segment",
+    "private-resource-type",
+    "private-navigation-error",
+    "private-frame-error",
+    "private-response-token",
+    "private-analytics-event",
+  ]) {
+    assert.doesNotMatch(serialized, new RegExp(secret));
+  }
+  await guard.dispose();
+});
+
+test("TikTok no-publish metadata taxonomy is bounded and fixed-vocabulary", async () => {
+  let routeHandler = null;
+  const page = {
+    async addInitScript() {},
+    frames() {
+      return [this];
+    },
+    async evaluate() {
+      return { blockedClickCount: 0 };
+    },
+    async route(_pattern, handler) {
+      routeHandler = handler;
+    },
+    async unroute() {},
+    on() {},
+    off() {},
+  };
+  const guard = await installNoPublishGuards(page, {
+    isLikelyPublishRequest: () => false,
+  });
+  guard.beginOperationBindingCapture("post-assignment");
+
+  const requests = [
+    {
+      method: () => "POST",
+      postDataJSON: () => ({}),
+      resourceType: () => "private-resource-type",
+      isNavigationRequest: () => false,
+      frame: () => {
+        throw new Error("private-worker-value");
+      },
+      url: () =>
+        `https://assets.tiktokcdn.com/api/v12/private-secret/${"x".repeat(600)}?token=private-query-token`,
+    },
+    {
+      method: () => "POST",
+      postDataJSON: () => ({}),
+      resourceType: () => "xhr",
+      isNavigationRequest: () => true,
+      frame: () => ({ parentFrame: () => null }),
+      url: () =>
+        "https://www.tiktok.com/api/v1/item/create/status/check/content/media/detail/list/save/update/auth/user?token=private-token",
+    },
+  ];
+  for (const request of requests) {
+    await routeHandler({
+      async abort() {
+        assert.fail("metadata-only candidates must not be blocked");
+      },
+      async continue() {},
+      request: () => request,
+    });
+  }
+
+  const capture = (await guard.getState()).operationBindingCapture;
+  assert.equal(capture.observationCount, 0);
+  assert.equal(capture.candidateObservationCount, 2);
+  assert.deepEqual(capture.candidateObservations[0].transportMetadata, {
+    originClass: "suffix-tiktokcdn-com",
+    pathLengthClass: "oversize",
+    pathSegmentCountClass: "not-inspected",
+    pathShape: ["oversize"],
+    pathShapeTruncated: true,
+    frameClass: "worker-or-unavailable",
+    navigationClass: "non-navigation",
+    resourceTypeClass: "unknown",
+  });
+  assert.deepEqual(capture.candidateObservations[1].transportMetadata, {
+    originClass: "suffix-tiktok-com",
+    pathLengthClass: "64-127",
+    pathSegmentCountClass: "13-plus",
+    pathShape: [
+      "api",
+      "version",
+      "item",
+      "create",
+      "status",
+      "check",
+      "content",
+      "media",
+      "detail",
+      "list",
+      "save",
+      "update",
+    ],
+    pathShapeTruncated: true,
+    frameClass: "main-frame",
+    navigationClass: "navigation",
+    resourceTypeClass: "xhr",
+  });
+  const serialized = JSON.stringify(capture);
+  for (const secret of [
+    "private-secret",
+    "private-query-token",
+    "private-token",
+    "private-resource-type",
+    "private-worker-value",
+    "xxxxxxxxxxxxxxxx",
+  ]) {
+    assert.doesNotMatch(serialized, new RegExp(secret));
+  }
+  await guard.dispose();
+});
+
+test("TikTok no-publish guard reserves candidate capacity for post-assignment", async () => {
+  let routeHandler = null;
+  const page = {
+    async addInitScript() {},
+    frames() {
+      return [this];
+    },
+    async evaluate() {
+      return { blockedClickCount: 0 };
+    },
+    async route(_pattern, handler) {
+      routeHandler = handler;
+    },
+    async unroute() {},
+    on() {},
+    off() {},
+  };
+  const guard = await installNoPublishGuards(page, {
+    isLikelyPublishRequest: () => false,
+  });
+  const emitCandidate = async (index) => {
+    const request = {
+      method: () => "POST",
+      postDataJSON: () => ({}),
+      url: () => `https://candidate-${index}.example.test/opaque`,
+    };
+    await routeHandler({
+      async abort() {
+        assert.fail("diagnostic candidates must not be blocked");
+      },
+      async continue() {},
+      request: () => request,
+    });
+  };
+
+  guard.beginOperationBindingCapture("page-load");
+  for (let index = 0; index < 65; index += 1) {
+    await emitCandidate(index);
+  }
+  guard.setOperationBindingCapturePhase("post-assignment");
+  await emitCandidate("post-assignment");
+
+  const capture = (await guard.getState()).operationBindingCapture;
+  assert.equal(capture.candidateObservationCount, 65);
+  assert.equal(capture.candidateOverflowCount, 1);
+  assert.equal(
+    capture.candidateObservations.at(-1).phase,
+    "post-assignment"
+  );
+  assert.equal(capture.transportSummary.mutationRequestCount, 66);
+  assert.equal(
+    capture.transportSummary.phaseCounts["page-load"].candidateRequestCount,
+    65
+  );
+  assert.equal(
+    capture.transportSummary.phaseCounts["post-assignment"]
+      .candidateRequestCount,
+    1
+  );
   await guard.dispose();
 });
 
@@ -392,6 +779,23 @@ test("TikTok file input hydration is bounded and remains fail closed", async () 
 test("TikTok diagnostic reaches resolution and records zero publication actions", async () => {
   const tree = await createTemporaryDiagnosticTree();
   const events = [];
+  let routeHandler = null;
+  const emitDiagnosticRequest = async (phaseLabel) => {
+    const request = {
+      method: () => "PUT",
+      postDataJSON: () => ({}),
+      url: () => `https://upload.tiktok.com/video/${phaseLabel}`,
+    };
+    await routeHandler({
+      async abort() {
+        assert.fail("diagnostic transport must not be blocked");
+      },
+      async continue() {
+        events.push(`request:${phaseLabel}`);
+      },
+      request: () => request,
+    });
+  };
   const page = {
     async addInitScript() {
       events.push("guard:click");
@@ -401,6 +805,7 @@ test("TikTok diagnostic reaches resolution and records zero publication actions"
     },
     async goto(url) {
       events.push(`goto:${url}`);
+      await emitDiagnosticRequest("page-load-request");
     },
     locator(selector) {
       assert.equal(selector, 'input[type="file"]');
@@ -417,13 +822,15 @@ test("TikTok diagnostic reaches resolution and records zero publication actions"
         },
         async setInputFiles(filePath) {
           events.push(`input:${path.basename(filePath)}`);
+          await emitDiagnosticRequest("post-assignment-request");
         },
         async waitFor() {
           events.push("input:attached");
         },
       };
     },
-    async route() {
+    async route(_pattern, handler) {
+      routeHandler = handler;
       events.push("guard:network");
     },
     async screenshot({ path: screenshotPath }) {
@@ -521,6 +928,17 @@ test("TikTok diagnostic reaches resolution and records zero publication actions"
     assert.equal(result.report.runOnceAttempted, false);
     assert.equal(result.report.publishRequestAttempted, false);
     assert.equal(result.report.queueMutated, false);
+    assert.equal(result.report.schemaVersion, 3);
+    assert.equal(
+      result.report.operationBindingCapture.captureOutcome,
+      "eligible-without-match"
+    );
+    assert.deepEqual(
+      result.report.operationBindingCapture.observations.map(({ phase }) =>
+        phase
+      ),
+      ["page-load", "post-assignment"]
+    );
     assert.deepEqual(
       result.report.readiness.transitions.map(({ phase }) => phase),
       ["hydrating-check-structure", "ready"]

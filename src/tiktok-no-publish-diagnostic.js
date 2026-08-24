@@ -23,9 +23,62 @@ const READINESS_STABLE_POLLS = 2;
 const FILE_INPUT_WAIT_TIMEOUT_MS = 120000;
 const MAX_BINDING_CAPTURE_BODY_BYTES = 1024 * 1024;
 const MAX_BINDING_CAPTURE_OBSERVATIONS = 128;
+const MAX_BINDING_CAPTURE_CANDIDATES = 128;
+const MAX_BINDING_CAPTURE_ITEMS_PER_PHASE = 64;
 const MAX_BINDING_CAPTURE_NODES = 512;
 const MAX_BINDING_CAPTURE_DEPTH = 8;
+const MAX_BINDING_CAPTURE_PATH_LENGTH = 512;
+const MAX_BINDING_CAPTURE_PATH_SEGMENTS = 12;
 const BINDING_CAPTURE_SETTLE_MS = 2000;
+const BINDING_CAPTURE_PHASES = new Set(["page-load", "post-assignment"]);
+const BINDING_CAPTURE_RESOURCE_TYPES = new Set([
+  "document",
+  "eventsource",
+  "fetch",
+  "font",
+  "image",
+  "manifest",
+  "media",
+  "other",
+  "script",
+  "stylesheet",
+  "texttrack",
+  "websocket",
+  "xhr",
+]);
+const BINDING_CAPTURE_SAFE_PATH_TOKENS = new Set([
+  "api",
+  "apply",
+  "auth",
+  "aweme",
+  "check",
+  "commit",
+  "content",
+  "create",
+  "creator",
+  "detail",
+  "draft",
+  "init",
+  "item",
+  "list",
+  "material",
+  "media",
+  "mget",
+  "post",
+  "project",
+  "publish",
+  "save",
+  "status",
+  "studio",
+  "submit",
+  "task",
+  "tiktok",
+  "update",
+  "upload",
+  "user",
+  "video",
+  "web",
+]);
 const OPERATION_BINDING_FIELDS = new Map([
   ["project_id", "project"],
   ["projectId", "project"],
@@ -357,6 +410,20 @@ function mergeOperationBindings(target, source) {
 
 function parseBoundedRequestPayload(request) {
   try {
+    if (typeof request.postDataBuffer === "function") {
+      const buffer = request.postDataBuffer();
+      if (
+        buffer &&
+        Number.isSafeInteger(buffer.length) &&
+        buffer.length > MAX_BINDING_CAPTURE_BODY_BYTES
+      ) {
+        return null;
+      }
+    }
+  } catch {
+    return null;
+  }
+  try {
     if (typeof request.postDataJSON === "function") {
       const parsed = request.postDataJSON();
       if (parsed && typeof parsed === "object") {
@@ -438,20 +505,296 @@ function matchFingerprintedBindings(requestBindings, responseBindings) {
   );
 }
 
-function isBindingCaptureTransport(request) {
-  const method = request.method().toUpperCase();
-  if (!BINDING_CAPTURE_METHODS.has(method)) {
-    return false;
+function normalizeBindingCapturePhase(value) {
+  const phase = String(value || "");
+  if (!BINDING_CAPTURE_PHASES.has(phase)) {
+    throw new Error("Unsupported operation-binding capture phase.");
   }
+  return phase;
+}
+
+function classifyBindingCapturePathLength(length) {
+  if (!Number.isSafeInteger(length) || length < 0) {
+    return "unavailable";
+  }
+  if (length === 0) {
+    return "empty";
+  }
+  if (length <= 31) {
+    return "1-31";
+  }
+  if (length <= 63) {
+    return "32-63";
+  }
+  if (length <= 127) {
+    return "64-127";
+  }
+  if (length <= 255) {
+    return "128-255";
+  }
+  if (length <= MAX_BINDING_CAPTURE_PATH_LENGTH) {
+    return "256-512";
+  }
+  return "oversize";
+}
+
+function classifyBindingCaptureSegmentCount(count) {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    return "unavailable";
+  }
+  if (count === 0) {
+    return "empty";
+  }
+  if (count <= 2) {
+    return "1-2";
+  }
+  if (count <= 4) {
+    return "3-4";
+  }
+  if (count <= 8) {
+    return "5-8";
+  }
+  if (count <= MAX_BINDING_CAPTURE_PATH_SEGMENTS) {
+    return "9-12";
+  }
+  return "13-plus";
+}
+
+function classifyBindingCapturePathSegment(value) {
+  const normalized = String(value || "").toLowerCase();
+  if (BINDING_CAPTURE_SAFE_PATH_TOKENS.has(normalized)) {
+    return normalized;
+  }
+  if (/^v[0-9]{1,2}$/.test(normalized)) {
+    return "version";
+  }
+  if (/^[0-9]{1,20}$/.test(normalized)) {
+    return "numeric";
+  }
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      normalized
+    )
+  ) {
+    return "uuid";
+  }
+  if (/^[0-9a-f]{16,64}$/.test(normalized)) {
+    return "hex-opaque";
+  }
+  return "opaque";
+}
+
+function classifyBindingCaptureOrigin(hostname) {
+  const normalized = String(hostname || "").toLowerCase();
+  if (normalized === "tiktok.com" || normalized.endsWith(".tiktok.com")) {
+    return "suffix-tiktok-com";
+  }
+  if (
+    normalized === "tiktokcdn.com" ||
+    normalized.endsWith(".tiktokcdn.com")
+  ) {
+    return "suffix-tiktokcdn-com";
+  }
+  if (normalized === "tiktokv.com" || normalized.endsWith(".tiktokv.com")) {
+    return "suffix-tiktokv-com";
+  }
+  if (
+    normalized === "byteoversea.com" ||
+    normalized.endsWith(".byteoversea.com")
+  ) {
+    return "suffix-byteoversea-com";
+  }
+  if (
+    normalized === "ibytedtos.com" ||
+    normalized.endsWith(".ibytedtos.com")
+  ) {
+    return "suffix-ibytedtos-com";
+  }
+  if (
+    normalized === "ibyteimg.com" ||
+    normalized.endsWith(".ibyteimg.com")
+  ) {
+    return "suffix-ibyteimg-com";
+  }
+  if (normalized === "muscdn.com" || normalized.endsWith(".muscdn.com")) {
+    return "suffix-muscdn-com";
+  }
+  return "cross-origin-other";
+}
+
+function getBindingCaptureRequestContext(request) {
+  let resourceTypeClass = "unavailable";
+  try {
+    if (typeof request.resourceType === "function") {
+      const resourceType = String(request.resourceType()).toLowerCase();
+      resourceTypeClass = BINDING_CAPTURE_RESOURCE_TYPES.has(resourceType)
+        ? resourceType
+        : "unknown";
+    }
+  } catch {
+    resourceTypeClass = "unavailable";
+  }
+
+  let navigationClass = "unavailable";
+  try {
+    if (typeof request.isNavigationRequest === "function") {
+      navigationClass = request.isNavigationRequest()
+        ? "navigation"
+        : "non-navigation";
+    }
+  } catch {
+    navigationClass = "unavailable";
+  }
+
+  let frameClass = "unavailable";
+  try {
+    if (typeof request.frame === "function") {
+      const frame = request.frame();
+      if (frame) {
+        frameClass =
+          typeof frame.parentFrame === "function" && frame.parentFrame()
+            ? "child-frame"
+            : "main-frame";
+      }
+    }
+  } catch {
+    frameClass = "worker-or-unavailable";
+  }
+
+  return { frameClass, navigationClass, resourceTypeClass };
+}
+
+function getSanitizedBindingCaptureTransportMetadata(request) {
+  const requestContext = getBindingCaptureRequestContext(request);
   try {
     const parsed = new URL(request.url());
-    if (!getTikTokRequestOrigin(parsed.href)) {
-      return false;
+    const pathLengthClass = classifyBindingCapturePathLength(
+      parsed.pathname.length
+    );
+    if (parsed.pathname.length > MAX_BINDING_CAPTURE_PATH_LENGTH) {
+      return {
+        originClass: classifyBindingCaptureOrigin(parsed.hostname),
+        pathLengthClass,
+        pathSegmentCountClass: "not-inspected",
+        pathShape: ["oversize"],
+        pathShapeTruncated: true,
+        ...requestContext,
+      };
     }
-    return /(?:upload|project|video|commit)/i.test(parsed.pathname);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    const pathSegmentCountClass = classifyBindingCaptureSegmentCount(
+      segments.length
+    );
+    return {
+      originClass: classifyBindingCaptureOrigin(parsed.hostname),
+      pathLengthClass,
+      pathSegmentCountClass,
+      pathShape: segments
+        .slice(0, MAX_BINDING_CAPTURE_PATH_SEGMENTS)
+        .map(classifyBindingCapturePathSegment),
+      pathShapeTruncated:
+        segments.length > MAX_BINDING_CAPTURE_PATH_SEGMENTS,
+      ...requestContext,
+    };
   } catch {
-    return false;
+    return {
+      originClass: "unparseable",
+      pathLengthClass: "unavailable",
+      pathSegmentCountClass: "unavailable",
+      pathShape: ["unparseable"],
+      pathShapeTruncated: false,
+      ...requestContext,
+    };
   }
+}
+
+function classifyBindingCaptureTransport(request) {
+  let method = "UNKNOWN";
+  try {
+    method = String(request.method()).toUpperCase();
+  } catch {
+    return {
+      eligible: false,
+      method,
+      mutation: false,
+      reason: "method-unavailable",
+    };
+  }
+  if (!BINDING_CAPTURE_METHODS.has(method)) {
+    return {
+      eligible: false,
+      method,
+      mutation: false,
+      reason: "method-not-observed",
+    };
+  }
+  let parsed;
+  try {
+    parsed = new URL(request.url());
+  } catch {
+    return {
+      eligible: false,
+      method,
+      mutation: true,
+      reason: "unparseable-url",
+    };
+  }
+  if (!getTikTokRequestOrigin(parsed.href)) {
+    return {
+      eligible: false,
+      method,
+      mutation: true,
+      reason: "origin-not-allowed",
+    };
+  }
+  if (!/(?:upload|project|video|commit)/i.test(parsed.pathname)) {
+    return {
+      eligible: false,
+      method,
+      mutation: true,
+      reason: "path-not-recognized",
+    };
+  }
+  return {
+    eligible: true,
+    method,
+    mutation: true,
+    reason: "eligible",
+  };
+}
+
+function fingerprintTransportEndpoint(request, secret) {
+  let endpoint = "unparseable-url";
+  try {
+    const parsed = new URL(request.url());
+    endpoint = `${parsed.protocol}//${parsed.host.toLowerCase()}${parsed.pathname}`;
+  } catch {
+    // Never fingerprint the raw unparseable value because it may contain secrets.
+  }
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`transport\0${endpoint}`)
+    .digest("hex");
+}
+
+function getBindingCaptureOutcome(
+  observations,
+  candidateObservations,
+  transportSummary
+) {
+  if (observations.some(({ matchedBindings }) => matchedBindings.length > 0)) {
+    return "matched-binding";
+  }
+  if (observations.length > 0) {
+    return "eligible-without-match";
+  }
+  if (candidateObservations.length > 0) {
+    return "candidate-observed-non-authoritative";
+  }
+  if (transportSummary.mutationRequestCount > 0) {
+    return "no-eligible-transport";
+  }
+  return "no-mutating-transport";
 }
 
 function getTikTokRequestOrigin(value) {
@@ -475,10 +818,63 @@ async function installNoPublishGuards(
   const guardErrors = [];
   const bindingCaptureSecret = crypto.randomBytes(32);
   const bindingCaptureObservations = [];
+  const bindingCaptureCandidateObservations = [];
   const observedBindingRequests = new WeakMap();
   const pendingBindingResponses = new Set();
   let bindingCaptureEnabled = false;
+  let bindingCapturePhase = "inactive";
   let bindingCaptureOverflowCount = 0;
+  let bindingCaptureCandidateOverflowCount = 0;
+  const bindingCaptureTransportSummary = {
+    observedRequestCount: 0,
+    mutationRequestCount: 0,
+    eligibleRequestCount: 0,
+    ignoredMethodCount: 0,
+    rejectedOriginCount: 0,
+    rejectedPathCount: 0,
+    unparseableUrlCount: 0,
+    phaseCounts: {},
+  };
+
+  const getPhaseCounts = () => {
+    if (!bindingCaptureTransportSummary.phaseCounts[bindingCapturePhase]) {
+      bindingCaptureTransportSummary.phaseCounts[bindingCapturePhase] = {
+        observedRequestCount: 0,
+        mutationRequestCount: 0,
+        eligibleRequestCount: 0,
+        candidateRequestCount: 0,
+      };
+    }
+    return bindingCaptureTransportSummary.phaseCounts[bindingCapturePhase];
+  };
+
+  const createBindingObservation = (request, transport, candidate) => ({
+    phase: bindingCapturePhase,
+    method: transport.method,
+    endpointFingerprint: fingerprintTransportEndpoint(
+      request,
+      bindingCaptureSecret
+    ),
+    ...(candidate
+      ? {
+          rejectionReason: transport.reason,
+        }
+      : { transportClass: "eligible-tiktok-operation" }),
+    transportMetadata: getSanitizedBindingCaptureTransportMetadata(request),
+    status: null,
+    requestBindings: fingerprintOperationBindings(
+      getRequestOperationBindings(request),
+      bindingCaptureSecret
+    ),
+    responseBindings: [],
+    matchedBindings: [],
+    responseBodyClass: "not-observed",
+  });
+
+  const hasCaptureCapacity = (observations, maximum) =>
+    observations.length < maximum &&
+    observations.filter(({ phase }) => phase === bindingCapturePhase).length <
+      MAX_BINDING_CAPTURE_ITEMS_PER_PHASE;
 
   await page.addInitScript(() => {
     const state = { blockedClickCount: 0 };
@@ -525,30 +921,61 @@ async function installNoPublishGuards(
       await route.abort("blockedbyclient");
       return;
     }
-    if (
-      bindingCaptureEnabled &&
-      isBindingCaptureTransport(request)
-    ) {
-      if (
-        bindingCaptureObservations.length >=
-        MAX_BINDING_CAPTURE_OBSERVATIONS
-      ) {
-        bindingCaptureOverflowCount += 1;
+    if (bindingCaptureEnabled) {
+      const transport = classifyBindingCaptureTransport(request);
+      const phaseCounts = getPhaseCounts();
+      bindingCaptureTransportSummary.observedRequestCount += 1;
+      phaseCounts.observedRequestCount += 1;
+      if (!transport.mutation) {
+        bindingCaptureTransportSummary.ignoredMethodCount += 1;
       } else {
-        const observation = {
-          method: request.method().toUpperCase(),
-          url: sanitizeRequestUrl(request.url()),
-          status: null,
-          requestBindings: fingerprintOperationBindings(
-            getRequestOperationBindings(request),
-            bindingCaptureSecret
-          ),
-          responseBindings: [],
-          matchedBindings: [],
-          responseBodyClass: "not-observed",
-        };
-        bindingCaptureObservations.push(observation);
-        observedBindingRequests.set(request, observation);
+        bindingCaptureTransportSummary.mutationRequestCount += 1;
+        phaseCounts.mutationRequestCount += 1;
+        if (transport.eligible) {
+          bindingCaptureTransportSummary.eligibleRequestCount += 1;
+          phaseCounts.eligibleRequestCount += 1;
+          if (
+            !hasCaptureCapacity(
+              bindingCaptureObservations,
+              MAX_BINDING_CAPTURE_OBSERVATIONS
+            )
+          ) {
+            bindingCaptureOverflowCount += 1;
+          } else {
+            const observation = createBindingObservation(
+              request,
+              transport,
+              false
+            );
+            bindingCaptureObservations.push(observation);
+            observedBindingRequests.set(request, observation);
+          }
+        } else {
+          phaseCounts.candidateRequestCount += 1;
+          if (transport.reason === "origin-not-allowed") {
+            bindingCaptureTransportSummary.rejectedOriginCount += 1;
+          } else if (transport.reason === "path-not-recognized") {
+            bindingCaptureTransportSummary.rejectedPathCount += 1;
+          } else if (transport.reason === "unparseable-url") {
+            bindingCaptureTransportSummary.unparseableUrlCount += 1;
+          }
+          if (
+            !hasCaptureCapacity(
+              bindingCaptureCandidateObservations,
+              MAX_BINDING_CAPTURE_CANDIDATES
+            )
+          ) {
+            bindingCaptureCandidateOverflowCount += 1;
+          } else {
+            const observation = createBindingObservation(
+              request,
+              transport,
+              true
+            );
+            bindingCaptureCandidateObservations.push(observation);
+            observedBindingRequests.set(request, observation);
+          }
+        }
       }
     }
     await route.continue();
@@ -565,6 +992,14 @@ async function installNoPublishGuards(
       observation.responseBodyClass = "non-success-status";
       return;
     }
+    const isCandidate = Boolean(observation.rejectionReason);
+    if (isCandidate) {
+      observation.responseBodyClass =
+        observation.requestBindings.length === 0
+          ? "request-binding-missing"
+          : "candidate-metadata-only";
+      return;
+    }
     const task = Promise.resolve()
       .then(async () => {
         const headers =
@@ -572,7 +1007,8 @@ async function installNoPublishGuards(
             ? await response.headers()
             : {};
         const contentType = String(headers?.["content-type"] || "");
-        const contentLength = Number(headers?.["content-length"] || 0);
+        const contentLengthValue = headers?.["content-length"];
+        const contentLength = Number(contentLengthValue);
         if (contentType && !/\bjson\b/i.test(contentType)) {
           observation.responseBodyClass = "non-json";
           return;
@@ -612,14 +1048,23 @@ async function installNoPublishGuards(
   }
 
   return {
-    beginOperationBindingCapture() {
+    beginOperationBindingCapture(phase) {
+      bindingCapturePhase = normalizeBindingCapturePhase(phase);
       bindingCaptureEnabled = true;
+    },
+    setOperationBindingCapturePhase(phase) {
+      if (!bindingCaptureEnabled) {
+        throw new Error("Operation-binding capture is not active.");
+      }
+      bindingCapturePhase = normalizeBindingCapturePhase(phase);
     },
     stopOperationBindingCapture() {
       bindingCaptureEnabled = false;
+      bindingCapturePhase = "inactive";
     },
     async dispose() {
       bindingCaptureEnabled = false;
+      bindingCapturePhase = "inactive";
       await page.unroute("**/*", routeHandler).catch(() => {});
       if (typeof page.off === "function") {
         page.off("response", responseHandler);
@@ -657,8 +1102,24 @@ async function installNoPublishGuards(
         blockedPublishRequests: [...blockedPublishRequests],
         guardErrors: [...guardErrors],
         operationBindingCapture: {
+          captureOutcome: getBindingCaptureOutcome(
+            bindingCaptureObservations,
+            bindingCaptureCandidateObservations,
+            bindingCaptureTransportSummary
+          ),
           observationCount: bindingCaptureObservations.length,
           overflowCount: bindingCaptureOverflowCount,
+          candidateObservationCount:
+            bindingCaptureCandidateObservations.length,
+          candidateOverflowCount: bindingCaptureCandidateOverflowCount,
+          transportSummary: {
+            ...bindingCaptureTransportSummary,
+            phaseCounts: Object.fromEntries(
+              Object.entries(
+                bindingCaptureTransportSummary.phaseCounts
+              ).map(([phase, counts]) => [phase, { ...counts }])
+            ),
+          },
           observations: bindingCaptureObservations.map((observation) => ({
             ...observation,
             requestBindings: observation.requestBindings.map((binding) => ({
@@ -671,6 +1132,20 @@ async function installNoPublishGuards(
               ...binding,
             })),
           })),
+          candidateObservations: bindingCaptureCandidateObservations.map(
+            (observation) => ({
+              ...observation,
+              requestBindings: observation.requestBindings.map((binding) => ({
+                ...binding,
+              })),
+              responseBindings: observation.responseBindings.map(
+                (binding) => ({ ...binding })
+              ),
+              matchedBindings: observation.matchedBindings.map((binding) => ({
+                ...binding,
+              })),
+            })
+          ),
         },
       };
     },
@@ -847,7 +1322,7 @@ async function runTikTokNoPublishDiagnostic(options, overrides = {}) {
     "readiness-transitions.json"
   );
   const report = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     diagnostic: "tiktok-phase-a-no-publish",
     status: "running",
     startedAt: new Date().toISOString(),
@@ -930,13 +1405,18 @@ async function runTikTokNoPublishDiagnostic(options, overrides = {}) {
     }
     page = contextPages[0];
     guard = await dependencies.installNoPublishGuards(page);
+    if (typeof guard.beginOperationBindingCapture === "function") {
+      guard.beginOperationBindingCapture("page-load");
+    }
 
     await page.goto(EXACT_UPLOAD_URL, { waitUntil: "domcontentloaded" });
     assertExactUploadPage(page.url());
 
     const fileInput = await waitForUniqueTikTokFileInput(page);
-    if (typeof guard.beginOperationBindingCapture === "function") {
-      guard.beginOperationBindingCapture();
+    if (typeof guard.setOperationBindingCapturePhase === "function") {
+      guard.setOperationBindingCapturePhase("post-assignment");
+    } else if (typeof guard.beginOperationBindingCapture === "function") {
+      guard.beginOperationBindingCapture("post-assignment");
     }
     await fileInput.setInputFiles(validated.sourcePath);
     await captureScreenshot("input-assigned.png");
