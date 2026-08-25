@@ -2927,9 +2927,34 @@ function resolveFinalPublishOperationBinding(
   return { ok: true, binding };
 }
 
+function classifyPublishPayloadValue(value) {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  const valueType = typeof value;
+  return ["object", "string", "number", "boolean", "undefined"].includes(
+    valueType
+  )
+    ? valueType
+    : "other";
+}
+
 function inspectPublishPayload(payload) {
-  if (!payload || typeof payload !== "object") {
-    return null;
+  const payloadClass = classifyPublishPayloadValue(payload);
+  const emptyInspection = (reasonCode, overrides = {}) => ({
+    ok: false,
+    reasonCode,
+    payloadClass,
+    rootSuccessObserved: false,
+    postIdCount: 0,
+    operationBindings: new Map(),
+    ...overrides,
+  });
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return emptyInspection("response-payload-unavailable");
   }
 
   let hasExplicitRootSuccess = false;
@@ -2938,12 +2963,12 @@ function inspectPublishPayload(payload) {
       continue;
     }
     if (!validValues.has(payload[key])) {
-      return null;
+      return emptyInspection("response-root-status-rejected");
     }
     hasExplicitRootSuccess = true;
   }
   if (!hasExplicitRootSuccess) {
-    return null;
+    return emptyInspection("response-root-success-missing");
   }
 
   const postIdKeys = new Set([
@@ -2959,6 +2984,7 @@ function inspectPublishPayload(payload) {
   const seen = new WeakSet();
   let visitedNodes = 0;
   let invalidPayload = false;
+  let payloadTooComplex = false;
 
   const visit = (value, depth) => {
     if (
@@ -2976,6 +3002,7 @@ function inspectPublishPayload(payload) {
     visitedNodes += 1;
     if (visitedNodes > 1000) {
       invalidPayload = true;
+      payloadTooComplex = true;
       return;
     }
 
@@ -3014,12 +3041,45 @@ function inspectPublishPayload(payload) {
   };
 
   visit(payload, 0);
-  if (invalidPayload || postIds.size !== 1) {
-    return null;
+  const diagnosticBase = {
+    payloadClass,
+    rootSuccessObserved: true,
+    postIdCount: postIds.size,
+    operationBindings,
+  };
+  if (payloadTooComplex) {
+    return {
+      ok: false,
+      reasonCode: "response-payload-too-complex",
+      ...diagnosticBase,
+    };
+  }
+  if (invalidPayload) {
+    return {
+      ok: false,
+      reasonCode: "response-business-status-rejected",
+      ...diagnosticBase,
+    };
+  }
+  if (postIds.size === 0) {
+    return {
+      ok: false,
+      reasonCode: "response-post-id-missing",
+      ...diagnosticBase,
+    };
+  }
+  if (postIds.size !== 1) {
+    return {
+      ok: false,
+      reasonCode: "response-post-id-ambiguous",
+      ...diagnosticBase,
+    };
   }
   return {
+    ok: true,
+    reasonCode: "response-payload-accepted",
+    ...diagnosticBase,
     postId: [...postIds][0],
-    operationBindings,
   };
 }
 
@@ -3132,6 +3192,21 @@ function mergePublishOperationBindings(target, source) {
     target.set(kind, targetValues);
   }
   return target;
+}
+
+function getPublishOperationBindingKinds(bindings) {
+  if (!bindings || typeof bindings[Symbol.iterator] !== "function") {
+    return [];
+  }
+  return [...bindings]
+    .filter(
+      ([kind, values]) =>
+        ["project", "video", "upload"].includes(kind) &&
+        values instanceof Set &&
+        values.size > 0
+    )
+    .map(([kind]) => kind)
+    .sort();
 }
 
 function getPublishRequestOperationBindings(request, payload) {
@@ -3293,6 +3368,54 @@ function hasExpectedPublishOperationBinding(bindings, expectedBinding) {
   );
 }
 
+function getPublishRequestInspectionReasonCode(requestEvidence) {
+  if (requestEvidence?.payloadAvailable !== true) {
+    return "request-payload-unavailable";
+  }
+  if (requestEvidence.payloadInspected !== true) {
+    return "request-payload-uninspectable";
+  }
+  return null;
+}
+
+function getPublishResponseReasonCode({
+  requestEvidence,
+  responseInspection,
+  matchedOperationBinding,
+  expectedOperationBinding,
+  activeComposerMatched,
+  operationAmbiguous,
+  candidateRequestCount,
+}) {
+  if (operationAmbiguous || candidateRequestCount !== 1) {
+    return "multiple-candidate-requests";
+  }
+  const requestInspectionReasonCode =
+    getPublishRequestInspectionReasonCode(requestEvidence);
+  if (requestInspectionReasonCode) {
+    return requestInspectionReasonCode;
+  }
+  if (requestEvidence.expectedCaptionMatched !== true) {
+    return "request-caption-not-observed";
+  }
+  if (!expectedOperationBinding) {
+    return "expected-operation-binding-unavailable";
+  }
+  if (requestEvidence.expectedOperationBindingMatched !== true) {
+    return "expected-operation-binding-not-observed";
+  }
+  if (responseInspection?.ok !== true) {
+    return responseInspection?.reasonCode || "response-payload-unavailable";
+  }
+  if (!matchedOperationBinding) {
+    return "operation-binding-mismatch";
+  }
+  if (activeComposerMatched !== true) {
+    return "active-composer-not-matched";
+  }
+  return "operation-bound-confirmation";
+}
+
 function createPublishResponseTracker(page) {
   let armed = false;
   let clickStarted = false;
@@ -3307,6 +3430,7 @@ function createPublishResponseTracker(page) {
   let candidateRequestCount = 0;
   let operationAmbiguous = false;
   let generation = 0;
+  let responseObservationGeneration = 0;
 
   const requestHandler = (request) => {
     if (!armed || !clickStarted) {
@@ -3323,7 +3447,9 @@ function createPublishResponseTracker(page) {
         if (publishApiSuccess) {
           publishApiSuccess = {
             ...publishApiSuccess,
+            reasonCode: "multiple-candidate-requests",
             currentVideoMatched: false,
+            expectedOperationBindingMatched: false,
             operationBindingMatched: false,
             candidateRequestCount,
           };
@@ -3335,9 +3461,14 @@ function createPublishResponseTracker(page) {
         expectedCaption
       );
       const bindingValues = getPublishRequestOperationBindings(request, payload);
-      startedRequests.set(request, requestEvidence && {
-        ...requestEvidence,
+      startedRequests.set(request, {
+        payloadAvailable: Boolean(payload && typeof payload === "object"),
+        payloadInspected: Boolean(requestEvidence),
+        payloadClass: classifyPublishPayloadValue(payload),
+        expectedCaptionMatched:
+          requestEvidence?.expectedCaptionMatched === true,
         bindingValues,
+        bindingKinds: getPublishOperationBindingKinds(bindingValues),
         expectedOperationBindingMatched:
           hasExpectedPublishOperationBinding(
             bindingValues,
@@ -3374,10 +3505,22 @@ function createPublishResponseTracker(page) {
       responseCompletedAfterClick: true,
       activeComposerMatched,
       expectedCaptionMatched: requestEvidence.expectedCaptionMatched,
+      requestExpectedOperationBindingMatched:
+        requestEvidence.expectedOperationBindingMatched,
       expectedOperationBindingMatched: false,
       operationBindingMatched: false,
       currentVideoMatched: false,
       candidateRequestCount,
+      diagnosticSchemaVersion: 1,
+      reasonCode: "response-body-pending",
+      requestPayloadClass: requestEvidence.payloadClass,
+      requestPayloadInspected: requestEvidence.payloadInspected,
+      requestBindingKinds: requestEvidence.bindingKinds,
+      expectedOperationBindingKind: expectedOperationBinding?.kind || null,
+      responsePayloadClass: "pending",
+      responseBindingKinds: [],
+      responsePostIdCount: null,
+      responseRootSuccessObserved: null,
     };
 
     if (status >= 200 && status < 300) {
@@ -3388,6 +3531,8 @@ function createPublishResponseTracker(page) {
       );
       const responseGeneration = generation;
       const responseOperationId = operationId;
+      responseObservationGeneration += 1;
+      const responseObservation = responseObservationGeneration;
       Promise.resolve()
         .then(() =>
           typeof response.json === "function" ? response.json() : null
@@ -3396,11 +3541,18 @@ function createPublishResponseTracker(page) {
           if (
             !armed ||
             generation !== responseGeneration ||
-            operationId !== responseOperationId
+            operationId !== responseOperationId ||
+            responseObservationGeneration !== responseObservation
           ) {
             return;
           }
-          const inspectedPayload = inspectPublishPayload(payload);
+          const responseInspection = inspectPublishPayload(payload);
+          const inspectedPayload = responseInspection.ok
+            ? {
+                postId: responseInspection.postId,
+                operationBindings: responseInspection.operationBindings,
+              }
+            : null;
           const matchedOperationBinding = matchPublishOperationBinding(
             requestEvidence.bindingValues,
             inspectedPayload?.operationBindings,
@@ -3409,42 +3561,101 @@ function createPublishResponseTracker(page) {
           const expectedOperationBindingMatched =
             requestEvidence.expectedOperationBindingMatched &&
             Boolean(matchedOperationBinding);
-          if (
-            !inspectedPayload ||
-            !matchedOperationBinding ||
-            !expectedOperationBindingMatched ||
-            operationAmbiguous ||
-            candidateRequestCount !== 1
-          ) {
-            return;
-          }
-          const currentVideoMatched =
-            activeComposerMatched && requestEvidence.expectedCaptionMatched;
-          publishApiSuccess = {
+          const bindingIsAuthoritative = Boolean(
+            inspectedPayload &&
+              matchedOperationBinding &&
+              expectedOperationBindingMatched &&
+              !operationAmbiguous &&
+              candidateRequestCount === 1
+          );
+          const currentVideoMatched = Boolean(
+            bindingIsAuthoritative &&
+              activeComposerMatched &&
+              requestEvidence.expectedCaptionMatched
+          );
+          const reasonCode = getPublishResponseReasonCode({
+            requestEvidence,
+            responseInspection,
+            matchedOperationBinding,
+            expectedOperationBinding,
+            activeComposerMatched,
+            operationAmbiguous,
+            candidateRequestCount,
+          });
+          const diagnosticEvidence = {
             ...evidence,
-            postId: inspectedPayload.postId,
-            postIdSource: "response-body",
-            expectedOperationBindingMatched,
-            operationBindingMatched: true,
-            operationBindingKind: matchedOperationBinding.kind,
-            operationBindingSource: matchedOperationBinding.source,
+            reasonCode,
+            expectedOperationBindingMatched: bindingIsAuthoritative,
+            operationBindingMatched: bindingIsAuthoritative,
             currentVideoMatched,
+            responsePayloadClass: responseInspection.payloadClass,
+            responseBindingKinds: getPublishOperationBindingKinds(
+              responseInspection.operationBindings
+            ),
+            responsePostIdCount: responseInspection.postIdCount,
+            responseRootSuccessObserved:
+              responseInspection.rootSuccessObserved,
           };
-          if (currentVideoMatched && responseOperationId) {
+          if (bindingIsAuthoritative) {
+            publishApiSuccess = {
+              ...diagnosticEvidence,
+              postId: inspectedPayload.postId,
+              postIdSource: "response-body",
+              operationBindingKind: matchedOperationBinding.kind,
+              operationBindingSource: matchedOperationBinding.source,
+            };
+          } else {
+            publishApiSuccess = diagnosticEvidence;
+          }
+          if (
+            reasonCode === "operation-bound-confirmation" &&
+            currentVideoMatched &&
+            responseOperationId
+          ) {
             console.log(
               `Publish API response bound to operation: ${method} ${status} ${url}`
             );
           }
         })
         .catch(() => {
-          // A 2xx response without a parseable, unique post ID remains unbound.
+          if (
+            !armed ||
+            generation !== responseGeneration ||
+            operationId !== responseOperationId ||
+            responseObservationGeneration !== responseObservation
+          ) {
+            return;
+          }
+          publishApiSuccess = {
+            ...evidence,
+            reasonCode:
+              operationAmbiguous || candidateRequestCount !== 1
+                ? "multiple-candidate-requests"
+                : "response-body-unavailable",
+            candidateRequestCount,
+            responsePayloadClass: "unavailable",
+          };
         });
       return;
     }
 
     if (status >= 400) {
+      if (requestEvidence.payloadInspected !== true) {
+        const requestInspectionReasonCode =
+          getPublishRequestInspectionReasonCode(requestEvidence);
+        publishApiSuccess = {
+          ...evidence,
+          reasonCode:
+            operationAmbiguous || candidateRequestCount !== 1
+              ? "multiple-candidate-requests"
+              : requestInspectionReasonCode,
+          responsePayloadClass: "not-inspected",
+        };
+        return;
+      }
       publishApiFailure = {
         ...evidence,
+        reasonCode: "publish-api-http-failure",
         reason: `Publish API returned ${status}: ${method} ${url}`,
       };
       console.log(publishApiFailure.reason);
@@ -3465,6 +3676,7 @@ function createPublishResponseTracker(page) {
       startedRequests = new WeakMap();
       candidateRequestCount = 0;
       operationAmbiguous = false;
+      responseObservationGeneration = 0;
       clickStarted = false;
       operationId = null;
       activeComposerMatched = false;
@@ -3651,8 +3863,47 @@ function getAllowlistedPublishNavigation(startedUrl, currentUrl) {
 
   return {
     type: "navigation",
-    from: startedWithoutHash,
-    to: currentWithoutHash,
+    from: `${started.origin}${started.pathname}`,
+    to: `${current.origin}${current.pathname}`,
+  };
+}
+
+function sanitizeScopedPublishConfirmationEvidence(evidence) {
+  if (!evidence) {
+    return null;
+  }
+  return {
+    type: "dom",
+    scope: "publish-confirmation-surface",
+    cueClass: "allowlisted-success-cue",
+    visible: evidence.visible === true,
+    observedAfterClick: evidence.observedAfterClick === true,
+  };
+}
+
+function buildUnboundPublishConfirmationEvidence({
+  http,
+  dom,
+  navigation,
+}) {
+  const sanitizedDom = sanitizeScopedPublishConfirmationEvidence(dom);
+  const primary = navigation || sanitizedDom || http;
+  if (!primary) {
+    return undefined;
+  }
+  const confirmationHints = { schemaVersion: 1 };
+  if (http) {
+    confirmationHints.http = http;
+  }
+  if (sanitizedDom) {
+    confirmationHints.dom = sanitizedDom;
+  }
+  if (navigation) {
+    confirmationHints.navigation = navigation;
+  }
+  return {
+    ...primary,
+    confirmationHints,
   };
 }
 
@@ -3673,7 +3924,9 @@ async function waitForPublishConfirmation(
   if (ownsTracker && typeof tracker.arm === "function") {
     tracker.arm();
   }
-  let lastUnboundHint = null;
+  let unboundHttpHint = null;
+  let unboundDomHint = null;
+  let unboundNavigationHint = null;
 
   try {
     for (let poll = 0; poll < safeMaxPolls; poll += 1) {
@@ -3700,7 +3953,7 @@ async function waitForPublishConfirmation(
         };
       }
       if (publishApiSuccess) {
-        lastUnboundHint = publishApiSuccess;
+        unboundHttpHint = publishApiSuccess;
       }
 
       const bodyText = await readBodyText(page);
@@ -3718,14 +3971,14 @@ async function waitForPublishConfirmation(
         baselineSurfaces
       );
       if (scopedSuccess) {
-        lastUnboundHint = scopedSuccess;
+        unboundDomHint = scopedSuccess;
       }
       const navigationEvidence = getAllowlistedPublishNavigation(
         startedUrl,
         page.url()
       );
       if (navigationEvidence) {
-        lastUnboundHint = navigationEvidence;
+        unboundNavigationHint = navigationEvidence;
       }
 
       if (poll + 1 < safeMaxPolls) {
@@ -3740,7 +3993,11 @@ async function waitForPublishConfirmation(
       reason:
         "No operation-bound TikTok publish confirmation observed within timeout. " +
         "Publication may have succeeded; no retry was attempted.",
-      evidence: lastUnboundHint || undefined,
+      evidence: buildUnboundPublishConfirmationEvidence({
+        http: unboundHttpHint,
+        dom: unboundDomHint,
+        navigation: unboundNavigationHint,
+      }),
     };
   } finally {
     if (ownsTracker) {
