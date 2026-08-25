@@ -1526,10 +1526,431 @@ test("TikTok publish response remains unbound after multiple candidate requests"
     page.emit("response", secondResponse);
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.equal(isAuthoritativePublishEvidence(tracker.success()), false);
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+    assert.equal(evidence.reasonCode, "multiple-candidate-requests");
+    assert.equal(evidence.candidateRequestCount, 2);
   } finally {
     tracker.dispose();
   }
+});
+
+test("TikTok unbound publish telemetry reports binding kinds without sensitive values", async () => {
+  const secretCaption = "private caption value";
+  const secretProject = "private-project-value";
+  const secretVideo = "private-video-value";
+  const secretQuery = "private-session-token";
+  const { page, request, response } = createPublishResponseHarness({
+    payload: {
+      code: 0,
+      data: {
+        project_id: secretProject,
+        post_id: "7420000000000000001",
+      },
+    },
+    requestUrl:
+      `https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=${secretQuery}`,
+    requestPayload: {
+      project_id: secretProject,
+      caption: secretCaption,
+    },
+  });
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: secretCaption,
+      expectedOperationBinding: { kind: "video", value: secretVideo },
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+    assert.equal(
+      evidence.reasonCode,
+      "expected-operation-binding-not-observed"
+    );
+    assert.equal(evidence.diagnosticSchemaVersion, 1);
+    assert.equal(evidence.requestPayloadClass, "object");
+    assert.deepEqual(evidence.requestBindingKinds, ["project"]);
+    assert.equal(evidence.expectedOperationBindingKind, "video");
+    assert.equal(evidence.requestExpectedOperationBindingMatched, false);
+    assert.equal(evidence.responsePayloadClass, "object");
+    assert.deepEqual(evidence.responseBindingKinds, ["project"]);
+    assert.equal(evidence.responsePostIdCount, 1);
+    assert.equal(evidence.responseRootSuccessObserved, true);
+    assert.equal(
+      evidence.url,
+      "https://www.tiktok.com/tiktok/web/project/post/v1/"
+    );
+
+    const serialized = JSON.stringify(evidence);
+    for (const secret of [
+      secretCaption,
+      secretProject,
+      secretVideo,
+      secretQuery,
+    ]) {
+      assert.equal(serialized.includes(secret), false, secret);
+    }
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok unbound publish telemetry assigns fixed response reason codes", async () => {
+  const cases = [
+    {
+      expectedReasonCode: "response-root-status-rejected",
+      payload: {
+        code: 1001,
+        data: {
+          project_id: "current-project",
+          post_id: "7420000000000000001",
+        },
+      },
+    },
+    {
+      expectedReasonCode: "response-root-success-missing",
+      payload: {
+        data: {
+          project_id: "current-project",
+          post_id: "7420000000000000001",
+        },
+      },
+    },
+    {
+      expectedReasonCode: "response-business-status-rejected",
+      payload: {
+        code: 0,
+        data: {
+          project_id: "current-project",
+          post_id: "7420000000000000001",
+          status_code: 1001,
+        },
+      },
+    },
+    {
+      expectedReasonCode: "response-post-id-missing",
+      payload: {
+        code: 0,
+        data: { project_id: "current-project" },
+      },
+    },
+    {
+      expectedReasonCode: "response-post-id-ambiguous",
+      payload: {
+        code: 0,
+        data: {
+          project_id: "current-project",
+          post_id: "7420000000000000001",
+          item_id: "7420000000000000002",
+        },
+      },
+    },
+  ];
+
+  for (const { expectedReasonCode, payload } of cases) {
+    const { page, request, response } = createPublishResponseHarness({
+      payload,
+      requestUrl:
+        "https://www.tiktok.com/tiktok/web/project/post/v1/?session_token=private-token",
+    });
+    const tracker = createPublishResponseTracker(page);
+    try {
+      tracker.arm({
+        expectedCaption: "fixture caption",
+        expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+      });
+      tracker.beginClick("operation-fixture", {
+        activeComposerMatched: true,
+      });
+      page.emit("request", request);
+      page.emit("response", response);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const evidence = tracker.success();
+      assert.equal(isAuthoritativePublishEvidence(evidence), false);
+      assert.equal(evidence.reasonCode, expectedReasonCode);
+      assert.equal(
+        JSON.stringify(evidence).includes("private-token"),
+        false
+      );
+    } finally {
+      tracker.dispose();
+    }
+  }
+});
+
+test("TikTok unbound publish telemetry records unavailable request payloads safely", async () => {
+  const { page, request, response } = createPublishResponseHarness({
+    requestUrl:
+      "https://www.tiktok.com/tiktok/web/project/post/v1/?project_id=current-project&session_token=private-token",
+  });
+  request.postDataJSON = () => {
+    throw new Error("private request parsing detail");
+  };
+  request.postData = () => "";
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+    assert.equal(evidence.reasonCode, "request-payload-unavailable");
+    assert.equal(evidence.requestPayloadClass, "null");
+    assert.equal(evidence.requestPayloadInspected, false);
+    assert.deepEqual(evidence.requestBindingKinds, ["project"]);
+    assert.equal(evidence.requestExpectedOperationBindingMatched, true);
+    const serialized = JSON.stringify(evidence);
+    assert.equal(serialized.includes("private-token"), false);
+    assert.equal(serialized.includes("private request parsing detail"), false);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok uninspectable HTTP failures remain passive with navigation evidence", async () => {
+  const cases = [
+    {
+      expectedReasonCode: "request-payload-unavailable",
+      expectedPayloadClass: "null",
+      prepareRequest(request) {
+        request.postDataJSON = () => {
+          throw new Error("private unavailable request detail");
+        };
+        request.postData = () => "";
+      },
+      privateValues: ["private unavailable request detail"],
+    },
+    {
+      expectedReasonCode: "request-payload-uninspectable",
+      expectedPayloadClass: "object",
+      requestPayload: {
+        caption: "fixture caption",
+        entries: Array.from({ length: 1001 }, () => ({})),
+      },
+      privateValues: [],
+    },
+  ];
+
+  for (const scenario of cases) {
+    const privateQuery = "private-http-token";
+    const privateNavigation = "private-navigation-token";
+    const { page, request, response } = createPublishResponseHarness({
+      requestPayload: scenario.requestPayload,
+      requestUrl:
+        "https://www.tiktok.com/tiktok/web/project/post/v1/" +
+        `?project_id=current-project&session_token=${privateQuery}`,
+    });
+    scenario.prepareRequest?.(request);
+    response.status = () => 500;
+    page.url = () =>
+      "https://www.tiktok.com/tiktokstudio/content" +
+      `?session_token=${privateNavigation}`;
+    page.locator = (selector) =>
+      selector === "body"
+        ? { innerText: async () => "" }
+        : { count: async () => 0 };
+    page.waitForTimeout = async () => {};
+
+    const tracker = createPublishResponseTracker(page);
+    try {
+      tracker.arm({
+        expectedCaption: "fixture caption",
+        expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+      });
+      tracker.beginClick("operation-fixture", {
+        activeComposerMatched: true,
+      });
+      page.emit("request", request);
+      page.emit("response", response);
+
+      assert.equal(tracker.failure(), null);
+      const passiveHttpEvidence = tracker.success();
+      assert.equal(
+        isAuthoritativePublishEvidence(passiveHttpEvidence),
+        false
+      );
+      assert.equal(passiveHttpEvidence.status, 500);
+      assert.equal(
+        passiveHttpEvidence.reasonCode,
+        scenario.expectedReasonCode
+      );
+      assert.equal(
+        passiveHttpEvidence.requestPayloadClass,
+        scenario.expectedPayloadClass
+      );
+      assert.equal(passiveHttpEvidence.requestPayloadInspected, false);
+      assert.equal(passiveHttpEvidence.responsePayloadClass, "not-inspected");
+
+      const result = await waitForPublishConfirmation(page, tracker, {
+        startedUrl: "https://www.tiktok.com/tiktokstudio/upload",
+        baselineSurfaces: [],
+        maxPolls: 1,
+        pollIntervalMs: 0,
+      });
+      assert.equal(result.outcome, "uncertain");
+      assert.equal(result.retryAllowed, false);
+      assert.equal(result.evidence.type, "navigation");
+      assert.deepEqual(
+        result.evidence.confirmationHints.http,
+        passiveHttpEvidence
+      );
+      assert.equal(
+        result.evidence.confirmationHints.navigation.to,
+        "https://www.tiktok.com/tiktokstudio/content"
+      );
+
+      const serialized = JSON.stringify(result);
+      for (const privateValue of [
+        privateQuery,
+        privateNavigation,
+        ...scenario.privateValues,
+      ]) {
+        assert.equal(serialized.includes(privateValue), false, privateValue);
+      }
+    } finally {
+      tracker.dispose();
+    }
+  }
+});
+
+test("TikTok inspectable HTTP failures preserve the existing failure outcome", () => {
+  const { page, request, response } = createPublishResponseHarness();
+  response.status = () => 500;
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+
+    const failure = tracker.failure();
+    assert.equal(failure.reasonCode, "publish-api-http-failure");
+    assert.equal(failure.status, 500);
+    assert.equal(tracker.success(), null);
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok unbound publish telemetry records unavailable response bodies safely", async () => {
+  const { page, request, response } = createPublishResponseHarness();
+  response.json = async () => {
+    throw new Error("private response parsing detail");
+  };
+  const tracker = createPublishResponseTracker(page);
+  try {
+    tracker.arm({
+      expectedCaption: "fixture caption",
+      expectedOperationBinding: EXPECTED_PUBLISH_OPERATION_BINDING,
+    });
+    tracker.beginClick("operation-fixture", {
+      activeComposerMatched: true,
+    });
+    page.emit("request", request);
+    page.emit("response", response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const evidence = tracker.success();
+    assert.equal(isAuthoritativePublishEvidence(evidence), false);
+    assert.equal(evidence.reasonCode, "response-body-unavailable");
+    assert.equal(evidence.responsePayloadClass, "unavailable");
+    assert.equal(
+      JSON.stringify(evidence).includes("private response parsing detail"),
+      false
+    );
+  } finally {
+    tracker.dispose();
+  }
+});
+
+test("TikTok uncertain confirmation preserves sanitized HTTP DOM and navigation hints", async () => {
+  const privateDomText = "Posted private-caption-must-not-persist";
+  const surfaceHandle = {
+    async dispose() {},
+    async evaluate() {
+      return false;
+    },
+  };
+  const page = {
+    url: () =>
+      "https://www.tiktok.com/tiktokstudio/content?session_token=private-navigation-token",
+    locator(selector) {
+      if (selector === "body") {
+        return { innerText: async () => "" };
+      }
+      return {
+        count: async () => 1,
+        nth: () => ({
+          evaluate: async () => true,
+          elementHandle: async () => surfaceHandle,
+          innerText: async () => privateDomText,
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+  const httpEvidence = {
+    type: "http",
+    method: "POST",
+    status: 200,
+    url: "https://www.tiktok.com/tiktok/web/project/post/v1/",
+    reasonCode: "expected-operation-binding-not-observed",
+  };
+  const result = await waitForPublishConfirmation(
+    page,
+    {
+      failure: () => null,
+      success: () => httpEvidence,
+      dispose() {},
+    },
+    {
+      startedUrl:
+        "https://www.tiktok.com/tiktokstudio/upload?csrf=private-start-token",
+      baselineSurfaces: [],
+      maxPolls: 1,
+      pollIntervalMs: 0,
+    }
+  );
+
+  assert.equal(result.outcome, "uncertain");
+  assert.equal(result.retryAllowed, false);
+  assert.equal(result.evidence.type, "navigation");
+  assert.deepEqual(result.evidence.confirmationHints.http, httpEvidence);
+  assert.equal(
+    result.evidence.confirmationHints.navigation.to,
+    "https://www.tiktok.com/tiktokstudio/content"
+  );
+  assert.deepEqual(result.evidence.confirmationHints.dom, {
+    type: "dom",
+    scope: "publish-confirmation-surface",
+    cueClass: "allowlisted-success-cue",
+    visible: true,
+    observedAfterClick: true,
+  });
+  assert.equal(JSON.stringify(result).includes(privateDomText), false);
+  assert.equal(JSON.stringify(result).includes("private-navigation-token"), false);
+  assert.equal(JSON.stringify(result).includes("private-start-token"), false);
 });
 
 const SAFE_MUSIC_CHECK_STATUS = "No issues found.";
