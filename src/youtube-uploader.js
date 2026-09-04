@@ -116,6 +116,30 @@ function sanitizeDiagnosticUrl(rawUrl) {
   }
 }
 
+function applyUploadOutcome(error, result) {
+  error.outcome = result.outcome;
+  error.retryAllowed = result.retryAllowed;
+  error.clickAttempted = result.clickAttempted;
+  error.reason = result.reason;
+  error.evidence = result.evidence;
+  return error;
+}
+
+function buildYouTubeUploadFailureResult(error, screenshotPath) {
+  return {
+    ok: false,
+    outcome: error.outcome || "failure",
+    retryAllowed:
+      typeof error.retryAllowed === "boolean" ? error.retryAllowed : true,
+    clickAttempted:
+      typeof error.clickAttempted === "boolean" ? error.clickAttempted : false,
+    reason: error.reason || error.message,
+    evidence: error.evidence,
+    error: error.message,
+    screenshotPath,
+  };
+}
+
 async function getHydrationDiagnostics(page) {
   const url = sanitizeDiagnosticUrl(page.url());
   const dom = await page
@@ -236,14 +260,71 @@ async function hasVisibleUploadsDialogChild(surface) {
   return false;
 }
 
+async function getExactActiveUploadWizard(surface) {
+  const tagName = await surface
+    .evaluate((element) => element.tagName)
+    .catch(() => "");
+  if (tagName !== "YTCP-UPLOADS-DIALOG") return surface;
+
+  const dialogs = surface.locator(
+    'tp-yt-paper-dialog#dialog, ytcp-dialog, [role="dialog"]'
+  );
+  const visibleDialogs = [];
+  const total = await dialogs.count();
+  for (let index = 0; index < total; index += 1) {
+    const candidate = dialogs.nth(index);
+    if (await candidate.isVisible().catch(() => false)) {
+      visibleDialogs.push(candidate);
+    }
+  }
+  if (visibleDialogs.length > 1) {
+    throw new Error(
+      "Could not safely bind the YouTube upload operation: " +
+        `${visibleDialogs.length} active inner upload wizards were recognized.`
+    );
+  }
+  return visibleDialogs[0] || surface;
+}
+
 async function getActiveUploadSurface(page) {
+  const activeSurfaces = [];
+  const addCandidate = async (surface, kind) => {
+    const handle = await surface.elementHandle().catch(() => null);
+    if (!handle) return;
+
+    for (let index = activeSurfaces.length - 1; index >= 0; index -= 1) {
+      const existing = activeSurfaces[index];
+      const same = await handle
+        .evaluate((element, other) => element === other, existing.handle)
+        .catch(() => false);
+      const existingContainsCurrent = await existing.handle
+        .evaluate((element, other) => element.contains(other), handle)
+        .catch(() => false);
+      const currentContainsExisting = await handle
+        .evaluate((element, other) => element.contains(other), existing.handle)
+        .catch(() => false);
+      if (!same && !existingContainsCurrent && !currentContainsExisting) continue;
+
+      const keepExisting =
+        existing.kind === "upload-host" ||
+        (kind !== "upload-host" && existingContainsCurrent);
+      if (keepExisting) {
+        await handle.dispose().catch(() => {});
+        return;
+      }
+      await existing.handle.dispose().catch(() => {});
+      activeSurfaces.splice(index, 1);
+    }
+    activeSurfaces.push({ surface, handle, kind });
+  };
+
   const uploadDialogs = page.locator("ytcp-uploads-dialog");
   const uploadDialogTotal = await uploadDialogs.count();
   for (let index = uploadDialogTotal - 1; index >= 0; index -= 1) {
     const surface = uploadDialogs.nth(index);
     const hostVisible = await surface.isVisible().catch(() => false);
     if (hostVisible || (await hasVisibleUploadsDialogChild(surface))) {
-      return surface;
+      await addCandidate(surface, "upload-host");
     }
   }
 
@@ -253,7 +334,7 @@ async function getActiveUploadSurface(page) {
     const surface = surfaces.nth(index);
     if (!(await surface.isVisible().catch(() => false))) continue;
     if (await isRecognizedFallbackUploadSurface(surface)) {
-      return surface;
+      await addCandidate(surface, "fallback-dialog");
     }
   }
 
@@ -262,19 +343,90 @@ async function getActiveUploadSurface(page) {
   for (let index = uploadProgressTotal - 1; index >= 0; index -= 1) {
     const surface = uploadProgress.nth(index);
     if (await surface.isVisible().catch(() => false)) {
-      return surface;
+      await addCandidate(surface, "upload-progress");
     }
   }
 
-  return null;
+  try {
+    if (activeSurfaces.length > 1) {
+      throw new Error(
+        `Could not safely bind the YouTube upload operation: ` +
+          `${activeSurfaces.length} active upload surfaces were recognized.`
+      );
+    }
+    return activeSurfaces[0]?.surface || null;
+  } finally {
+    await Promise.all(
+      activeSurfaces.map(({ handle }) => handle.dispose().catch(() => {}))
+    );
+  }
 }
 
-async function requireActiveUploadSurface(page) {
+async function createYouTubeOperationBinding(page) {
+  const surface = await getActiveUploadSurface(page);
+  if (!surface) {
+    throw new Error("Could not bind the active YouTube upload dialog.");
+  }
+  const surfaceHandle = await surface.elementHandle().catch(() => null);
+  if (!surfaceHandle) {
+    throw new Error("Could not retain the active YouTube upload dialog identity.");
+  }
+  try {
+    const wizard = await getExactActiveUploadWizard(surface);
+    const wizardHandle = await wizard.elementHandle().catch(() => null);
+    if (!wizardHandle) {
+      throw new Error("Could not retain the active YouTube upload wizard identity.");
+    }
+    return { surfaceHandle, wizardHandle, expectedVideoId: null };
+  } catch (error) {
+    await surfaceHandle.dispose().catch(() => {});
+    throw error;
+  }
+}
+
+async function requireActiveUploadSurface(page, operation) {
   const surface = await getActiveUploadSurface(page);
   if (!surface) {
     throw new Error("Could not find the active YouTube upload dialog.");
   }
-  return surface;
+  const wizard = await getExactActiveUploadWizard(surface);
+  if (operation?.surfaceHandle && operation?.wizardHandle) {
+    const currentHandle = await surface.elementHandle().catch(() => null);
+    const currentWizardHandle = await wizard.elementHandle().catch(() => null);
+    if (!currentHandle || !currentWizardHandle) {
+      await currentHandle?.dispose().catch(() => {});
+      await currentWizardHandle?.dispose().catch(() => {});
+      throw new Error("Could not inspect the active YouTube upload dialog identity.");
+    }
+    try {
+      const sameHost = await currentHandle
+        .evaluate((element, expected) => element === expected, operation.surfaceHandle)
+        .catch(() => false);
+      const sameWizard = await currentWizardHandle
+        .evaluate((element, expected) => element === expected, operation.wizardHandle)
+        .catch(() => false);
+      const hostConnected = await operation.surfaceHandle
+        .evaluate((element) => element.isConnected)
+        .catch(() => false);
+      const wizardReady = await operation.wizardHandle
+        .evaluate(
+          (element) =>
+            element.isConnected &&
+            Boolean(element.getClientRects().length) &&
+            getComputedStyle(element).visibility !== "hidden"
+        )
+        .catch(() => false);
+      if (!sameHost || !sameWizard || !hostConnected || !wizardReady) {
+        throw new Error(
+          "YouTube upload dialog identity changed during the upload operation."
+        );
+      }
+    } finally {
+      await currentHandle.dispose().catch(() => {});
+      await currentWizardHandle.dispose().catch(() => {});
+    }
+  }
+  return wizard;
 }
 
 async function getUploadFileInput(surface) {
@@ -377,15 +529,16 @@ async function setVideoFile(page, videoPath, options = {}) {
     throw new Error("Could not open the active YouTube upload dialog.");
   }
 
-  let surface = await requireActiveUploadSurface(page);
+  const operation = await createYouTubeOperationBinding(page);
+  let surface = await requireActiveUploadSurface(page, operation);
   let fileInput = await getUploadFileInput(surface);
   if (fileInput) {
     await fileInput.setInputFiles(videoPath);
-    return;
+    return operation;
   }
 
   const tryViaFileChooser = async () => {
-    const activeSurface = await requireActiveUploadSurface(page);
+    const activeSurface = await requireActiveUploadSurface(page, operation);
     const exactUploadPattern = exactUiTextPattern(
       "youtubeUploadVideo",
       "youtubeSelectFiles"
@@ -436,19 +589,19 @@ async function setVideoFile(page, videoPath, options = {}) {
   };
 
   if (await tryViaFileChooser()) {
-    return;
+    return operation;
   }
 
   await page.waitForTimeout(1200);
   if (await tryViaFileChooser()) {
-    return;
+    return operation;
   }
 
-  surface = await requireActiveUploadSurface(page);
+  surface = await requireActiveUploadSurface(page, operation);
   fileInput = await getUploadFileInput(surface);
   if (fileInput) {
     await fileInput.setInputFiles(videoPath);
-    return;
+    return operation;
   }
 
   const uploadUrl = page.url();
@@ -457,8 +610,8 @@ async function setVideoFile(page, videoPath, options = {}) {
   );
 }
 
-async function setTitleAndDescription(page, caption, fileNameStem) {
-  const surface = await requireActiveUploadSurface(page);
+async function setTitleAndDescription(page, caption, fileNameStem, operation) {
+  const surface = await requireActiveUploadSurface(page, operation);
   const effectiveCaption = caption && caption.trim() ? caption.trim() : "";
   const baseTitle = effectiveCaption || fileNameStem;
   const shortTitle = baseTitle.slice(0, 95);
@@ -520,8 +673,8 @@ async function setTitleAndDescription(page, caption, fileNameStem) {
   }
 }
 
-async function markNotMadeForKids(page) {
-  const surface = await requireActiveUploadSurface(page);
+async function markNotMadeForKids(page, operation) {
+  const surface = await requireActiveUploadSurface(page, operation);
   const selectors = [
     surface.locator('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'),
     surface.locator('[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]'),
@@ -550,8 +703,8 @@ async function markNotMadeForKids(page) {
   throw new Error('Could not select "not made for kids" option.');
 }
 
-async function setNotAgeRestricted(page) {
-  const surface = await requireActiveUploadSurface(page);
+async function setNotAgeRestricted(page, operation) {
+  const surface = await requireActiveUploadSurface(page, operation);
   const desired = surface.locator(
     'tp-yt-paper-radio-button[name="VIDEO_AGE_RESTRICTION_NONE"]'
   );
@@ -984,6 +1137,7 @@ async function clickNext(
     maxAdvanceClicks = 4,
     transitionTimeoutMs = 30000,
     pollIntervalMs = 100,
+    operation = null,
   } = {}
 ) {
   const parsedMaxAdvanceClicks = Number(maxAdvanceClicks);
@@ -1046,7 +1200,9 @@ async function clickNext(
           throwTransitionTimeout();
         }
 
-        const surface = await getActiveUploadSurface(page).catch(() => null);
+        const surface = await requireActiveUploadSurface(page, operation).catch(
+          () => null
+        );
         const removedSurvey = surface
           ? await removeExactGoogleSurveyOverlay(page)
           : false;
@@ -1162,8 +1318,16 @@ async function clickNext(
   }
 }
 
-async function setVisibilityAndPublish(page) {
-  const surface = await requireActiveUploadSurface(page);
+async function setVisibilityAndPublish(page, operation) {
+  const surface = await requireActiveUploadSurface(page, operation);
+  const preClickFailure = (reason, baselineTexts = []) => ({
+    ok: false,
+    outcome: "failure",
+    retryAllowed: true,
+    clickAttempted: false,
+    reason,
+    baselineTexts,
+  });
   const exactPublicPattern = exactUiTextPattern("youtubePublic");
   const visibilityOptions = [
     surface.locator('tp-yt-paper-radio-button[name="PUBLIC"], [name="PUBLIC"]'),
@@ -1195,31 +1359,73 @@ async function setVisibilityAndPublish(page) {
         publicSelected = true;
         break;
       }
-      return { ok: false, baselineTexts: [] };
+      return preClickFailure("YouTube Public visibility did not become selected.");
     }
     if (publicSelected) break;
   }
   if (!publicSelected) {
-    return { ok: false, baselineTexts: [] };
+    return preClickFailure("Could not select YouTube Public visibility.");
   }
 
-  const baselineTexts = await readYouTubePublishStatusTexts(page);
+  const prePublishReference = await getYouTubeVideoReferenceFromContext(surface);
+  if (operation && prePublishReference?.videoId) {
+    operation.expectedVideoId = prePublishReference.videoId;
+  }
+  const baselineTexts = await readYouTubePublishStatusTexts(page, { operation });
   const publishTarget = await getUniqueActivePublishTarget(surface, 1000);
   if (!publishTarget) {
-    return { ok: false, baselineTexts };
+    return preClickFailure(
+      "Could not find the unique active YouTube Publish button.",
+      baselineTexts
+    );
   }
 
   try {
     await publishTarget.handle.scrollIntoViewIfNeeded({ timeout: 3000 });
-    try {
-      await publishTarget.handle.click({ timeout: 5000 });
-    } catch (error) {
-      throw new Error(
-        "YouTube Publish click had an ambiguous outcome; " +
-          `no retry was attempted. ${error.message}`
+    const finalSurface = await requireActiveUploadSurface(page, operation);
+    const finalTarget = await getUniqueActivePublishTarget(finalSurface, 1000);
+    if (!finalTarget) {
+      return preClickFailure(
+        "YouTube Publish target disappeared before the final action.",
+        baselineTexts
       );
     }
-    return { ok: true, baselineTexts };
+    try {
+      const sameTarget = await finalTarget.handle
+        .evaluate((element, expected) => element === expected, publishTarget.handle)
+        .catch(() => false);
+      if (!sameTarget) {
+        return preClickFailure(
+          "YouTube Publish target identity changed before the final action.",
+          baselineTexts
+        );
+      }
+      await publishTarget.handle.click({ timeout: 5000 });
+    } catch (error) {
+      throw applyUploadOutcome(
+        new Error(
+          "YouTube Publish click had an ambiguous outcome; " +
+            `no retry was attempted. ${error.message}`
+        ),
+        {
+          outcome: "uncertain",
+          retryAllowed: false,
+          clickAttempted: true,
+          reason:
+            "YouTube Publish click had an ambiguous outcome; " +
+            `no retry was attempted. ${error.message}`,
+        }
+      );
+    } finally {
+      await finalTarget.handle.dispose().catch(() => {});
+    }
+    return {
+      ok: true,
+      outcome: "clicked",
+      retryAllowed: false,
+      clickAttempted: true,
+      baselineTexts,
+    };
   } finally {
     await publishTarget.handle.dispose().catch(() => {});
   }
@@ -1360,7 +1566,11 @@ async function getExplicitDialogPublishMatch(context, text, reference) {
   return reference ? getMatchedYouTubePublishedText(text) : null;
 }
 
-async function readPublishEvidenceEntry(candidate, evidenceType) {
+async function readPublishEvidenceEntry(
+  candidate,
+  evidenceType,
+  operationBound = false
+) {
   if (!(await candidate.isVisible().catch(() => false))) {
     return null;
   }
@@ -1386,6 +1596,7 @@ async function readPublishEvidenceEntry(candidate, evidenceType) {
   return {
     text,
     evidenceType,
+    operationBound,
     matchedText,
     videoUrl: reference?.videoUrl || null,
     videoId: reference?.videoId || null,
@@ -1447,6 +1658,7 @@ function classifyYouTubePublishStatusChanges(currentTexts, baselineTexts = []) {
   }
 
   let sawSuccess = false;
+  let sawError = false;
   for (const text of currentTexts) {
     for (const signal of extractYouTubePublishSignals(text)) {
       const remaining = remainingBaseline.get(signal) || 0;
@@ -1455,10 +1667,7 @@ function classifyYouTubePublishStatusChanges(currentTexts, baselineTexts = []) {
         continue;
       }
       if (signal.startsWith("error:")) {
-        return {
-          state: "error",
-          reason: "YouTube reported an error while publishing.",
-        };
+        sawError = true;
       }
       if (signal.startsWith("success:")) {
         sawSuccess = true;
@@ -1466,6 +1675,18 @@ function classifyYouTubePublishStatusChanges(currentTexts, baselineTexts = []) {
     }
   }
 
+  if (sawError && sawSuccess) {
+    return {
+      state: "conflict",
+      reason: "YouTube displayed conflicting publish confirmation evidence.",
+    };
+  }
+  if (sawError) {
+    return {
+      state: "error",
+      reason: "YouTube reported an error while publishing.",
+    };
+  }
   return sawSuccess ? { state: "success" } : { state: "pending" };
 }
 
@@ -1516,12 +1737,35 @@ function selectNewYouTubePublishEvidence(entries, baselineTexts = []) {
   return null;
 }
 
-async function readYouTubePublishEvidence(page) {
+async function readYouTubePublishEvidence(page, { operation = null } = {}) {
   const entries = [];
-  const surface = await getActiveUploadSurface(page);
-  if (surface && (await surface.isVisible().catch(() => false))) {
-    const entry = await readPublishEvidenceEntry(surface, "upload-surface");
-    if (entry) entries.push(entry);
+  const surface = await getActiveUploadSurface(page).catch(() => null);
+  if (surface) {
+    const wizard = await getExactActiveUploadWizard(surface).catch(() => null);
+    let operationBound = false;
+    if (wizard && operation?.surfaceHandle && operation?.wizardHandle) {
+      const surfaceHandle = await surface.elementHandle().catch(() => null);
+      const wizardHandle = await wizard.elementHandle().catch(() => null);
+      if (surfaceHandle && wizardHandle) {
+        const sameHost = await surfaceHandle
+          .evaluate((element, expected) => element === expected, operation.surfaceHandle)
+          .catch(() => false);
+        const sameWizard = await wizardHandle
+          .evaluate((element, expected) => element === expected, operation.wizardHandle)
+          .catch(() => false);
+        operationBound = sameHost && sameWizard;
+      }
+      await surfaceHandle?.dispose().catch(() => {});
+      await wizardHandle?.dispose().catch(() => {});
+    }
+    if (wizard && (await wizard.isVisible().catch(() => false))) {
+      const entry = await readPublishEvidenceEntry(
+        wizard,
+        "upload-surface",
+        operationBound
+      );
+      if (entry) entries.push(entry);
+    }
   }
 
   const feedback = page.locator('tp-yt-paper-toast, [role="alert"]');
@@ -1530,7 +1774,7 @@ async function readYouTubePublishEvidence(page) {
     const candidate = feedback.nth(index);
     const role = await candidate.getAttribute("role").catch(() => null);
     const evidenceType = role === "alert" ? "alert" : "toast";
-    const entry = await readPublishEvidenceEntry(candidate, evidenceType);
+    const entry = await readPublishEvidenceEntry(candidate, evidenceType, false);
     if (entry) entries.push(entry);
   }
 
@@ -1539,7 +1783,8 @@ async function readYouTubePublishEvidence(page) {
   for (let index = 0; index < dialogTotal; index += 1) {
     const entry = await readPublishEvidenceEntry(
       dialogs.nth(index),
-      "post-publish-dialog"
+      "post-publish-dialog",
+      false
     );
     if (entry) entries.push(entry);
   }
@@ -1547,28 +1792,44 @@ async function readYouTubePublishEvidence(page) {
   return entries;
 }
 
-async function readYouTubePublishStatusTexts(page) {
-  const entries = await readYouTubePublishEvidence(page);
-  return entries.map((entry) => entry.text);
+async function readYouTubePublishStatusTexts(page, options = {}) {
+  const entries = await readYouTubePublishEvidence(page, options);
+  const operation = options.operation || null;
+  const eligibleEntries = operation
+    ? entries.filter(
+        (entry) =>
+          entry.operationBound === true ||
+          (operation.expectedVideoId && entry.videoId === operation.expectedVideoId)
+      )
+    : entries;
+  return eligibleEntries.map((entry) => entry.text);
 }
 
 async function waitForPublishConfirmation(
   page,
   baselineTexts = [],
-  { maxPolls = 40, pollIntervalMs = 1500 } = {}
+  { maxPolls = 40, pollIntervalMs = 1500, operation = null } = {}
 ) {
   const safeMaxPolls = Math.max(1, Number(maxPolls) || 1);
   const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
   for (let i = 0; i < safeMaxPolls; i += 1) {
-    const entries = await readYouTubePublishEvidence(page);
-    const currentTexts = entries.map((entry) => entry.text);
+    const entries = await readYouTubePublishEvidence(page, { operation });
+    const eligibleEntries = operation
+      ? entries.filter(
+          (entry) =>
+            entry.operationBound === true ||
+            (operation.expectedVideoId &&
+              entry.videoId === operation.expectedVideoId)
+        )
+      : entries;
+    const currentTexts = eligibleEntries.map((entry) => entry.text);
     const classification = classifyYouTubePublishStatusChanges(
       currentTexts,
       baselineTexts
     );
     if (classification.state === "success") {
       const evidence = selectNewYouTubePublishEvidence(
-        entries,
+        eligibleEntries,
         baselineTexts
       );
       return {
@@ -1580,8 +1841,39 @@ async function waitForPublishConfirmation(
         videoId: evidence?.videoId || null,
       };
     }
+    if (classification.state === "conflict") {
+      return {
+        ok: false,
+        confirmed: false,
+        outcome: "uncertain",
+        retryAllowed: false,
+        clickAttempted: true,
+        reason: classification.reason,
+        evidence: {
+          evidenceType: "confirmation-conflict",
+          operationBound: Boolean(
+            operation?.surfaceHandle && operation?.wizardHandle
+          ),
+          expectedVideoId: operation?.expectedVideoId || null,
+        },
+      };
+    }
     if (classification.state === "error") {
-      return { ok: false, reason: classification.reason };
+      return {
+        ok: false,
+        confirmed: false,
+        outcome: "failure",
+        retryAllowed: false,
+        clickAttempted: true,
+        reason: classification.reason,
+        evidence: {
+          evidenceType: "operation-bound-error",
+          operationBound: Boolean(
+            operation?.surfaceHandle && operation?.wizardHandle
+          ),
+          expectedVideoId: operation?.expectedVideoId || null,
+        },
+      };
     }
     if (i + 1 < safeMaxPolls) {
       await page.waitForTimeout(safePollIntervalMs);
@@ -1592,10 +1884,16 @@ async function waitForPublishConfirmation(
     confirmed: false,
     outcome: "uncertain",
     retryAllowed: false,
+    clickAttempted: true,
     reason:
       "No reliable YouTube publish confirmation within timeout. " +
       "Publish confirmation was not observed; publication may have succeeded; " +
       "no retry was attempted.",
+    evidence: {
+      evidenceType: "confirmation-timeout",
+      operationBound: Boolean(operation?.surfaceHandle && operation?.wizardHandle),
+      expectedVideoId: operation?.expectedVideoId || null,
+    },
   };
 }
 
@@ -1650,29 +1948,43 @@ async function uploadVideo({ videoPath, caption, accountId }) {
   const context = await openPersistentContext(accountId);
   const page = context.pages()[0] || (await context.newPage());
   let closeHoldMs = 0;
+  let operation = null;
   try {
     await gotoUploadPage(page);
-    await setVideoFile(page, absoluteVideoPath);
+    operation = await setVideoFile(page, absoluteVideoPath);
     await page.waitForTimeout(Math.max(config.postDelayMs, 5000));
     await setTitleAndDescription(
       page,
       caption,
-      path.parse(absoluteVideoPath).name
+      path.parse(absoluteVideoPath).name,
+      operation
     );
-    await markNotMadeForKids(page);
-    await setNotAgeRestricted(page);
-    await clickNext(page);
-    const publishAttempt = await setVisibilityAndPublish(page);
+    await markNotMadeForKids(page, operation);
+    await setNotAgeRestricted(page, operation);
+    await clickNext(page, { operation });
+    const publishAttempt = await setVisibilityAndPublish(page, operation);
     if (!publishAttempt.ok) {
-      throw new Error("Could not find/click YouTube publish button.");
+      const failure = {
+        outcome: publishAttempt.outcome || "failure",
+        retryAllowed:
+          typeof publishAttempt.retryAllowed === "boolean"
+            ? publishAttempt.retryAllowed
+            : true,
+        clickAttempted: publishAttempt.clickAttempted === true,
+        reason:
+          publishAttempt.reason || "Could not find/click YouTube publish button.",
+        evidence: publishAttempt.evidence,
+      };
+      throw applyUploadOutcome(new Error(failure.reason), failure);
     }
 
     const confirmation = await waitForPublishConfirmation(
       page,
-      publishAttempt.baselineTexts
+      publishAttempt.baselineTexts,
+      { operation }
     );
     if (!confirmation.ok) {
-      throw new Error(confirmation.reason);
+      throw applyUploadOutcome(new Error(confirmation.reason), confirmation);
     }
 
     const successScreenshotPath = path.resolve(
@@ -1683,6 +1995,10 @@ async function uploadVideo({ videoPath, caption, accountId }) {
     closeHoldMs = Math.max(config.postPublishHoldMs, 0);
     return {
       ok: true,
+      outcome: "success",
+      retryAllowed: false,
+      clickAttempted: true,
+      reason: "YouTube publication was confirmed by operation-bound evidence.",
       confirmation: {
         confirmed: confirmation.confirmed,
         evidenceType: confirmation.evidenceType,
@@ -1700,12 +2016,14 @@ async function uploadVideo({ videoPath, caption, accountId }) {
     );
     await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => { });
     closeHoldMs = Math.max(config.failureHoldMs, 0);
-    return {
-      ok: false,
-      error: error.message,
-      screenshotPath,
-    };
+    return buildYouTubeUploadFailureResult(error, screenshotPath);
   } finally {
+    if (operation?.wizardHandle) {
+      await operation.wizardHandle.dispose().catch(() => {});
+    }
+    if (operation?.surfaceHandle) {
+      await operation.surfaceHandle.dispose().catch(() => {});
+    }
     await page.waitForTimeout(closeHoldMs).catch(() => { });
     await context.close();
   }
@@ -1719,7 +2037,9 @@ module.exports = {
   _private: {
     classifyYouTubePublishText,
     classifyYouTubePublishStatusChanges,
+    buildYouTubeUploadFailureResult,
     clickNext,
+    createYouTubeOperationBinding,
     exactUiTextPattern,
     getCreateButtonLocators,
     getActiveUploadSurface,

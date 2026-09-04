@@ -158,6 +158,69 @@ function exactUiTextPattern(...keys) {
   return new RegExp(`^\\s*(?:${labels.map(escapeRegExp).join("|")})\\s*$`, "i");
 }
 
+function createOneShotActionGuard(actionName) {
+  let consumed = false;
+  return {
+    consume() {
+      if (consumed) {
+        throw new Error(`${actionName} action budget was already consumed.`);
+      }
+      consumed = true;
+    },
+    get consumed() {
+      return consumed;
+    },
+  };
+}
+
+function applyUploadOutcome(error, result) {
+  error.outcome = result.outcome;
+  error.retryAllowed = result.retryAllowed;
+  error.clickAttempted = result.clickAttempted;
+  error.reason = result.reason;
+  error.evidence = result.evidence;
+  return error;
+}
+
+function buildInstagramUploadFailureResult(
+  error,
+  screenshotPath,
+  { actionAttempted = false } = {}
+) {
+  const hasBoundPostClickOutcome =
+    ["failure", "uncertain"].includes(error?.outcome) &&
+    error?.retryAllowed === false &&
+    error?.clickAttempted === true;
+  if (actionAttempted && !hasBoundPostClickOutcome) {
+    const reason =
+      "Instagram post confirmation failed after Share was dispatched; " +
+      "publication may have succeeded and no retry was attempted.";
+    return {
+      ok: false,
+      outcome: "uncertain",
+      retryAllowed: false,
+      clickAttempted: true,
+      reason,
+      evidence: error?.evidence,
+      error: reason,
+      screenshotPath,
+    };
+  }
+
+  return {
+    ok: false,
+    outcome: error.outcome || "failure",
+    retryAllowed:
+      typeof error.retryAllowed === "boolean" ? error.retryAllowed : true,
+    clickAttempted:
+      typeof error.clickAttempted === "boolean" ? error.clickAttempted : false,
+    reason: error.reason || error.message,
+    evidence: error.evidence,
+    error: error.message,
+    screenshotPath,
+  };
+}
+
 function getUploadTriggerLocators(page) {
   const uploadTriggerPattern = uiLabels.pattern("instagramUploadTrigger");
   return [
@@ -183,7 +246,19 @@ async function hasVisibleEnabledLocator(locator) {
 
 async function isCreateUploadReady(page, input) {
   if ((await input.count()) > 0) {
-    return true;
+    const structurallyOwned = await input
+      .first()
+      .evaluate((element) => {
+        const owner = element.closest('[role="dialog"], [aria-modal="true"]');
+        return Boolean(
+          owner &&
+            owner.isConnected &&
+            owner.getClientRects().length &&
+            getComputedStyle(owner).visibility !== "hidden"
+        );
+      })
+      .catch(() => false);
+    if (structurallyOwned) return true;
   }
 
   for (const trigger of getUploadTriggerLocators(page)) {
@@ -258,6 +333,7 @@ async function getActiveCreateSurface(page) {
   const total = await dialogs.count();
   const exactNextPattern = exactUiTextPattern("next");
   const exactSharePattern = exactUiTextPattern("share");
+  const matches = [];
 
   for (let index = total - 1; index >= 0; index -= 1) {
     const dialog = dialogs.nth(index);
@@ -271,15 +347,77 @@ async function getActiveCreateSurface(page) {
       (await dialog.getByRole("button", { name: exactSharePattern }).count()) > 0;
     const hasCaption = Boolean(await findVisibleCaptionTarget(dialog));
     if (hasNext || hasShare || hasCaption) {
-      return dialog;
+      matches.push(dialog);
     }
   }
 
-  return null;
+  if (matches.length > 1) {
+    throw new Error(
+      `Could not safely bind the Instagram create operation: ` +
+        `${matches.length} active create dialogs were recognized.`
+    );
+  }
+  return matches[0] || null;
+}
+
+async function createInstagramOperationBinding(page) {
+  const surface = await getActiveCreateSurface(page);
+  if (!surface) {
+    throw new Error("Could not bind the active Instagram create dialog.");
+  }
+  const surfaceHandle = await surface.elementHandle().catch(() => null);
+  if (!surfaceHandle) {
+    throw new Error("Could not retain the active Instagram create dialog identity.");
+  }
+  return {
+    surfaceHandle,
+    actionGuard: createOneShotActionGuard("Instagram Share"),
+  };
+}
+
+async function requireBoundInstagramSurface(page, operation) {
+  const surface = await getActiveCreateSurface(page);
+  if (!surface) {
+    throw new Error("Could not find the active Instagram create dialog.");
+  }
+  if (!operation?.surfaceHandle) return surface;
+
+  const currentHandle = await surface.elementHandle().catch(() => null);
+  if (!currentHandle) {
+    throw new Error("Could not inspect the active Instagram create dialog identity.");
+  }
+  try {
+    const sameOwner = await currentHandle
+      .evaluate((element, expected) => element === expected, operation.surfaceHandle)
+      .catch(() => false);
+    const ownerReady = await operation.surfaceHandle
+      .evaluate(
+        (element) =>
+          element.isConnected &&
+          Boolean(element.getClientRects().length) &&
+          getComputedStyle(element).visibility !== "hidden"
+      )
+      .catch(() => false);
+    if (!sameOwner || !ownerReady) {
+      throw new Error(
+        "Instagram create dialog identity changed during the upload operation."
+      );
+    }
+    return surface;
+  } finally {
+    await currentHandle.dispose().catch(() => {});
+  }
 }
 
 async function ensureCreateFlowInput(page) {
-  const input = page.locator('input[type="file"]').first();
+  const inputs = page.locator('input[type="file"]');
+  const inputCount = await inputs.count();
+  if (inputCount > 1) {
+    throw new Error(
+      `Could not safely select the Instagram file input: observed ${inputCount}.`
+    );
+  }
+  const input = inputs.first();
   if (await isCreateUploadReady(page, input)) return input;
 
   const createPattern = uiLabels.pattern("create");
@@ -395,21 +533,25 @@ async function setVideoFile(page, videoPath) {
   }
 
   // Some Instagram variants add the input only after the upload trigger click.
-  input = page.locator('input[type="file"]').first();
+  const inputsAfterTrigger = page.locator('input[type="file"]');
+  const inputCountAfterTrigger = await inputsAfterTrigger.count();
+  if (inputCountAfterTrigger !== 1) {
+    throw new Error(
+      "Could not uniquely bind the Instagram file input after the upload trigger."
+    );
+  }
+  input = inputsAfterTrigger.first();
   await input.waitFor({ state: "attached", timeout: 120000 });
   await input.setInputFiles(videoPath);
 }
 
-async function clickNextButtons(page) {
+async function clickNextButtons(page, operation) {
   const exactNextPattern = exactUiTextPattern("next");
   let clickCount = 0;
 
   for (let pass = 0; pass < 3; pass += 1) {
     await dismissVideoPostsAreReelsDialog(page);
-    const surface = await getActiveCreateSurface(page);
-    if (!surface) {
-      throw new Error("Could not find the active Instagram create dialog.");
-    }
+    const surface = await requireBoundInstagramSurface(page, operation);
     if (await findVisibleCaptionTarget(surface)) {
       return clickCount;
     }
@@ -438,20 +580,17 @@ async function clickNextButtons(page) {
     }
   }
 
-  const surface = await getActiveCreateSurface(page);
+  const surface = await requireBoundInstagramSurface(page, operation);
   if (surface && (await findVisibleCaptionTarget(surface))) {
     return clickCount;
   }
   throw new Error("Instagram composer did not reach the caption step.");
 }
 
-async function setCaption(page, caption) {
+async function setCaption(page, caption, operation) {
   if (!caption) return;
 
-  const surface = await getActiveCreateSurface(page);
-  if (!surface) {
-    throw new Error("Could not find the active Instagram create dialog.");
-  }
+  const surface = await requireBoundInstagramSurface(page, operation);
 
   for (const locator of getCaptionLocators(surface)) {
     const total = await locator.count();
@@ -473,68 +612,437 @@ async function setCaption(page, caption) {
   throw new Error("Could not fill the Instagram caption inside the create dialog.");
 }
 
-async function clickShare(page) {
-  const surface = await getActiveCreateSurface(page);
-  if (!surface) return false;
-
+async function getUniqueActiveInstagramShareTarget(surface) {
   const sharePattern = exactUiTextPattern("share");
   const shareLocators = [
     surface.getByRole("button", { name: sharePattern }),
     surface.locator("button").filter({ hasText: sharePattern }),
     surface.locator('[role="button"]').filter({ hasText: sharePattern }),
   ];
+  const activeTargets = [];
 
-  for (const locator of shareLocators) {
-    const clicked = await clickFirstVisibleEnabledLocator(page, locator, {
-      allowForceFallback: false,
-    });
-    if (clicked) return true;
+  try {
+    for (const locator of shareLocators) {
+      const total = await locator.count();
+      for (let index = 0; index < total; index += 1) {
+        const candidate = locator.nth(index);
+        const visible = await candidate.isVisible().catch(() => false);
+        const disabled = await candidate.isDisabled().catch(() => true);
+        if (!visible || disabled) continue;
+
+        const handle = await candidate.elementHandle().catch(() => null);
+        if (!handle) continue;
+        const identity = await handle
+          .evaluate((element) => ({
+            visibleText: String(element.innerText || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+            ariaLabel: String(element.getAttribute("aria-label") || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+          }))
+          .catch(() => null);
+        if (
+          !identity ||
+          !sharePattern.test(identity.visibleText) ||
+          (identity.ariaLabel && !sharePattern.test(identity.ariaLabel))
+        ) {
+          await handle.dispose().catch(() => {});
+          continue;
+        }
+        let duplicate = false;
+        for (const existing of activeTargets) {
+          duplicate = await handle
+            .evaluate((element, other) => element === other, existing.handle)
+            .catch(() => false);
+          if (duplicate) break;
+        }
+        if (duplicate) {
+          await handle.dispose().catch(() => {});
+        } else {
+          activeTargets.push({ handle });
+        }
+      }
+    }
+
+    if (activeTargets.length > 1) {
+      throw new Error(
+        "Could not safely publish the Instagram post: multiple active Share buttons."
+      );
+    }
+    return activeTargets[0] || null;
+  } catch (error) {
+    await Promise.all(
+      activeTargets.map(({ handle }) => handle.dispose().catch(() => {}))
+    );
+    throw error;
   }
-  return false;
 }
 
-async function waitForPostConfirmation(page, startedUrl) {
-  // Wait up to 60 * 1500ms = 90 seconds for upload processing
-  for (let i = 0; i < 60; i += 1) {
-    const text = await page.locator("body").innerText().catch(() => "");
-    if (uiLabels.pattern("posted").test(text)) {
-      return { ok: true };
+async function inspectFinalInstagramShareBoundary(
+  page,
+  expectedSurfaceHandle,
+  expectedTargetHandle
+) {
+  if (!expectedSurfaceHandle || !expectedTargetHandle) {
+    return { ok: false, reason: "missing-boundary-identity" };
+  }
+  const shareLabels = uiLabels.terms("share");
+  return page
+    .evaluate(
+      ({ expectedSurface, expectedTarget, allowedLabels }) => {
+        const normalize = (value) =>
+          String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+        const allowed = new Set(allowedLabels.map(normalize));
+        const isVisible = (element) => {
+          if (!element?.isConnected || !element.getClientRects().length) {
+            return false;
+          }
+          const style = getComputedStyle(element);
+          return style.display !== "none" && style.visibility !== "hidden";
+        };
+        const hasExactShareIdentity = (element) => {
+          if (!isVisible(element)) return false;
+          if (
+            element.disabled === true ||
+            normalize(element.getAttribute("aria-disabled")) === "true"
+          ) {
+            return false;
+          }
+          const visibleText = normalize(element.innerText);
+          const ariaLabel = normalize(element.getAttribute("aria-label"));
+          return (
+            Boolean(visibleText) &&
+            allowed.has(visibleText) &&
+            (!ariaLabel || allowed.has(ariaLabel))
+          );
+        };
+
+        if (!isVisible(expectedSurface)) {
+          return { ok: false, reason: "owner-changed" };
+        }
+        if (!expectedSurface.contains(expectedTarget)) {
+          return { ok: false, reason: "target-identity-changed" };
+        }
+        const visibleDialogs = Array.from(
+          new Set(
+            document.querySelectorAll('[role="dialog"], [aria-modal="true"]')
+          )
+        ).filter(isVisible);
+        if (
+          visibleDialogs.length !== 1 ||
+          visibleDialogs[0] !== expectedSurface
+        ) {
+          return { ok: false, reason: "unexpected-dialog" };
+        }
+        const candidates = Array.from(
+          expectedSurface.querySelectorAll('button, [role="button"]')
+        ).filter(hasExactShareIdentity);
+        if (candidates.length !== 1) {
+          return { ok: false, reason: "target-count-changed" };
+        }
+        if (candidates[0] !== expectedTarget) {
+          return { ok: false, reason: "target-identity-changed" };
+        }
+        return { ok: true };
+      },
+      {
+        expectedSurface: expectedSurfaceHandle,
+        expectedTarget: expectedTargetHandle,
+        allowedLabels: shareLabels,
+      }
+    )
+    .catch(() => ({ ok: false, reason: "boundary-inspection-failed" }));
+}
+
+async function clickShare(page, operation) {
+  const surface = await requireBoundInstagramSurface(page, operation);
+  const target = await getUniqueActiveInstagramShareTarget(surface);
+  if (!target) {
+    return {
+      ok: false,
+      outcome: "failure",
+      retryAllowed: true,
+      clickAttempted: false,
+      reason: "Could not find the unique active Instagram Share button.",
+    };
+  }
+
+  const actionGuard =
+    operation?.actionGuard || createOneShotActionGuard("Instagram Share");
+  const temporarySurfaceHandle = operation?.surfaceHandle
+    ? null
+    : await surface.elementHandle().catch(() => null);
+  try {
+    await target.handle.scrollIntoViewIfNeeded({ timeout: 3000 });
+    const finalBoundary = await inspectFinalInstagramShareBoundary(
+      page,
+      operation?.surfaceHandle || temporarySurfaceHandle,
+      target.handle
+    );
+    if (!finalBoundary.ok) {
+      const reasonByCode = {
+        "unexpected-dialog":
+          "An unexpected Instagram dialog appeared before the final Share action.",
+        "target-identity-changed":
+          "Instagram Share target identity changed before the final action.",
+      };
+      return {
+        ok: false,
+        outcome: "failure",
+        retryAllowed: true,
+        clickAttempted: false,
+        reason:
+          reasonByCode[finalBoundary.reason] ||
+          "Instagram Share boundary changed before the final action.",
+      };
     }
-    if (uiLabels.pattern("error").test(text)) {
-      return { ok: false, reason: "Instagram reported an error while posting." };
+    try {
+      actionGuard.consume();
+      await target.handle.click({ timeout: 5000 });
+    } catch (error) {
+      return {
+        ok: false,
+        outcome: "uncertain",
+        retryAllowed: false,
+        clickAttempted: true,
+        reason:
+          "Instagram Share click had an ambiguous outcome; " +
+          "publication may have succeeded and no retry was attempted.",
+      };
+    }
+    return {
+      ok: true,
+      outcome: "clicked",
+      retryAllowed: false,
+      clickAttempted: true,
+      reason: "Instagram Share click was dispatched once.",
+    };
+  } finally {
+    if (temporarySurfaceHandle) {
+      await temporarySurfaceHandle.dispose().catch(() => {});
+    }
+    await target.handle.dispose().catch(() => {});
+  }
+}
+
+function parseInstagramPostReference(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl, "https://www.instagram.com");
+    if (!["instagram.com", "www.instagram.com"].includes(parsed.hostname.toLowerCase())) {
+      return null;
+    }
+    const match = /^\/(?:p|reel|reels)\/([^/?#]+)/i.exec(parsed.pathname);
+    if (!match || !/^[a-zA-Z0-9_-]{5,128}$/.test(match[1])) return null;
+    return {
+      postId: match[1],
+      postUrl: `${parsed.origin}${parsed.pathname}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readInstagramConfirmationEvidence(page, operation) {
+  const entries = [];
+  const addEntry = async (candidate, evidenceType, operationBound) => {
+    if (!(await candidate.isVisible().catch(() => false))) return;
+    const text = String(await candidate.innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) return;
+    const hasSuccess = uiLabels.pattern("posted").test(text);
+    const hasError = uiLabels.pattern("error").test(text);
+    if (!hasSuccess && !hasError) return;
+    let reference = null;
+    const links = candidate.locator("a[href]");
+    const total = await links.count();
+    for (let index = 0; index < total && !reference; index += 1) {
+      reference = parseInstagramPostReference(
+        await links.nth(index).getAttribute("href").catch(() => "")
+      );
+    }
+    entries.push({
+      key: `${evidenceType}:${text}`,
+      evidenceType,
+      operationBound,
+      hasSuccess,
+      hasError,
+      matchedText: hasSuccess ? text.match(uiLabels.pattern("posted"))?.[0] || null : null,
+      postId: reference?.postId || null,
+      postUrl: reference?.postUrl || null,
+    });
+  };
+
+  if (operation?.surfaceHandle) {
+    const boundVisible = await operation.surfaceHandle
+      .evaluate(
+        (element) =>
+          element.isConnected &&
+          Boolean(element.getClientRects().length) &&
+          getComputedStyle(element).visibility !== "hidden"
+      )
+      .catch(() => false);
+    if (boundVisible) {
+      const surface = await getActiveCreateSurface(page).catch(() => null);
+      if (surface) {
+        const currentHandle = await surface.elementHandle().catch(() => null);
+        const sameOwner = currentHandle
+          ? await currentHandle
+              .evaluate((element, expected) => element === expected, operation.surfaceHandle)
+              .catch(() => false)
+          : false;
+        if (currentHandle) await currentHandle.dispose().catch(() => {});
+        if (sameOwner) await addEntry(surface, "bound-composer", true);
+      }
+    }
+  }
+
+  const feedback = page.locator(
+    '[role="alert"], [role="status"], [aria-live="assertive"], [aria-live="polite"]'
+  );
+  const feedbackTotal = await feedback.count();
+  for (let index = 0; index < feedbackTotal; index += 1) {
+    await addEntry(feedback.nth(index), "feedback", false);
+  }
+
+  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const dialogTotal = await dialogs.count();
+  for (let index = 0; index < dialogTotal; index += 1) {
+    const dialog = dialogs.nth(index);
+    let sameOwner = false;
+    if (operation?.surfaceHandle) {
+      const handle = await dialog.elementHandle().catch(() => null);
+      if (handle) {
+        sameOwner = await handle
+          .evaluate((element, expected) => element === expected, operation.surfaceHandle)
+          .catch(() => false);
+        await handle.dispose().catch(() => {});
+      }
+    }
+    if (!sameOwner) await addEntry(dialog, "post-share-dialog", false);
+  }
+  return entries;
+}
+
+async function waitForPostConfirmation(
+  page,
+  operation,
+  baselineEntries = [],
+  { maxPolls = 60, pollIntervalMs = 1500 } = {}
+) {
+  const baseline = new Map();
+  for (const entry of baselineEntries) {
+    baseline.set(entry.key, (baseline.get(entry.key) || 0) + 1);
+  }
+  const startedUrl = operation?.startedUrl || page.url();
+  const safeMaxPolls = Math.max(1, Number(maxPolls) || 1);
+  const safePollIntervalMs = Math.max(0, Number(pollIntervalMs) || 0);
+
+  for (let poll = 0; poll < safeMaxPolls; poll += 1) {
+    const current = await readInstagramConfirmationEvidence(page, operation);
+    const remaining = new Map(baseline);
+    const fresh = current.filter((entry) => {
+      const count = remaining.get(entry.key) || 0;
+      if (count > 0) {
+        remaining.set(entry.key, count - 1);
+        return false;
+      }
+      return true;
+    });
+
+    for (const entry of fresh) {
+      if (entry.hasSuccess && entry.hasError) {
+        return {
+          ok: false,
+          outcome: "uncertain",
+          retryAllowed: false,
+          clickAttempted: true,
+          reason: "Instagram displayed conflicting post confirmation evidence.",
+        };
+      }
+      if (entry.hasError && (entry.operationBound || entry.postId)) {
+        return {
+          ok: false,
+          outcome: "failure",
+          retryAllowed: false,
+          clickAttempted: true,
+          reason: "Instagram reported an operation-bound error while posting.",
+        };
+      }
+      if (entry.hasSuccess && (entry.operationBound || entry.postId)) {
+        return {
+          ok: true,
+          outcome: "success",
+          retryAllowed: false,
+          clickAttempted: true,
+          reason: "Instagram publication was confirmed by operation-bound evidence.",
+          evidence: {
+            evidenceType: entry.evidenceType,
+            matchedText: entry.matchedText,
+            postId: entry.postId,
+            postUrl: entry.postUrl,
+          },
+        };
+      }
     }
 
-    const currentUrl = page.url();
-    if (currentUrl !== startedUrl && !/\/create\//i.test(currentUrl)) {
-      return { ok: true };
+    const navigationReference = parseInstagramPostReference(page.url());
+    if (page.url() !== startedUrl && navigationReference) {
+      return {
+        ok: true,
+        outcome: "success",
+        retryAllowed: false,
+        clickAttempted: true,
+        reason: "Instagram navigated to a canonical post reference after Share.",
+        evidence: { evidenceType: "post-navigation", ...navigationReference },
+      };
     }
-    await page.waitForTimeout(1500);
+    if (poll + 1 < safeMaxPolls) {
+      await page.waitForTimeout(safePollIntervalMs);
+    }
   }
-  return { ok: false, reason: "No reliable Instagram post confirmation within timeout." };
+  return {
+    ok: false,
+    outcome: "uncertain",
+    retryAllowed: false,
+    clickAttempted: true,
+    reason:
+      "No operation-bound Instagram post confirmation was observed within timeout. " +
+      "Publication may have succeeded; no retry was attempted.",
+  };
 }
 
 async function uploadVideo({ videoPath, caption, accountId }) {
   const absoluteVideoPath = path.resolve(videoPath);
   const context = await openPersistentContext(accountId);
-  const page = context.pages()[0] || (await context.newPage());
+  let page = null;
   let closeHoldMs = 0;
+  let operation = null;
 
   try {
+    page = context.pages()[0] || (await context.newPage());
     await gotoUploadPage(page);
     await setVideoFile(page, absoluteVideoPath);
     await page.waitForTimeout(Math.max(config.postDelayMs, 5000));
-    await clickNextButtons(page);
-    await setCaption(page, caption || config.defaultCaption);
+    operation = await createInstagramOperationBinding(page);
+    await clickNextButtons(page, operation);
+    await setCaption(page, caption || config.defaultCaption, operation);
 
-    const startedUrl = page.url();
-    const shared = await clickShare(page);
-    if (!shared) {
-      throw new Error("Could not find/click Instagram Share button.");
+    operation.startedUrl = page.url();
+    const baselineEntries = await readInstagramConfirmationEvidence(page, operation);
+    const shareResult = await clickShare(page, operation);
+    if (!shareResult.ok) {
+      throw applyUploadOutcome(new Error(shareResult.reason), shareResult);
     }
 
-    const confirmation = await waitForPostConfirmation(page, startedUrl);
+    const confirmation = await waitForPostConfirmation(
+      page,
+      operation,
+      baselineEntries
+    );
     if (!confirmation.ok) {
-      throw new Error(confirmation.reason);
+      throw applyUploadOutcome(new Error(confirmation.reason), confirmation);
     }
 
     const successScreenshotPath = path.resolve(
@@ -545,22 +1053,36 @@ async function uploadVideo({ videoPath, caption, accountId }) {
 
     // Hold the browser open so background processing finishes
     closeHoldMs = Math.max(config.postPublishHoldMs || 15000, 15000);
-    return { ok: true };
+    return {
+      ok: true,
+      outcome: "success",
+      retryAllowed: false,
+      clickAttempted: true,
+      reason: confirmation.reason,
+      evidence: confirmation.evidence,
+      postUrl: confirmation.evidence?.postUrl || null,
+      postId: confirmation.evidence?.postId || null,
+    };
   } catch (error) {
     const screenshotPath = path.resolve(
       config.projectRoot,
       "last-instagram-upload-error.png"
     );
-    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => { });
+    if (page) {
+      await page
+        .screenshot({ path: screenshotPath, fullPage: true })
+        .catch(() => {});
+    }
 
     closeHoldMs = Math.max(config.failureHoldMs, 0);
-    return {
-      ok: false,
-      error: error.message,
-      screenshotPath,
-    };
+    return buildInstagramUploadFailureResult(error, screenshotPath, {
+      actionAttempted: operation?.actionGuard?.consumed === true,
+    });
   } finally {
-    if (closeHoldMs > 0) {
+    if (operation?.surfaceHandle) {
+      await operation.surfaceHandle.dispose().catch(() => {});
+    }
+    if (page && closeHoldMs > 0) {
       console.log(`Holding browser for ${closeHoldMs / 1000}s before closing...`);
       await page.waitForTimeout(closeHoldMs).catch(() => { });
     }
@@ -577,12 +1099,19 @@ module.exports = {
     ensureCreateFlowInput,
     clickNextButtons,
     clickShare,
+    createInstagramOperationBinding,
     dismissVideoPostsAreReelsDialog,
     exactUiTextPattern,
     getActiveCreateSurface,
     isCreateUploadReady,
+    parseInstagramPostReference,
+    readInstagramConfirmationEvidence,
+    requireBoundInstagramSurface,
+    inspectFinalInstagramShareBoundary,
     setCaption,
     setVideoFile,
+    waitForPostConfirmation,
+    buildInstagramUploadFailureResult,
   },
 };
 

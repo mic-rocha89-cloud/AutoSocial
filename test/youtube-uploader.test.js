@@ -9,9 +9,11 @@ const uiLabels = require("../src/platform-ui-labels");
 const { _private } = require("../src/youtube-uploader");
 
 const {
+  buildYouTubeUploadFailureResult,
   classifyYouTubePublishStatusChanges,
   classifyYouTubePublishText,
   clickNext,
+  createYouTubeOperationBinding,
   getActiveUploadSurface,
   markNotMadeForKids,
   openUploadDialog,
@@ -23,6 +25,11 @@ const {
   setVisibilityAndPublish,
   waitForPublishConfirmation,
 } = _private;
+
+async function disposeYouTubeOperation(operation) {
+  await operation?.wizardHandle?.dispose().catch(() => {});
+  await operation?.surfaceHandle?.dispose().catch(() => {});
+}
 
 test("YouTube UI labels recognize the observed PT-BR controls", () => {
   assert.equal(uiLabels.pattern("youtubeCreate").test("Criar"), true);
@@ -567,7 +574,7 @@ test("YouTube PT-BR wizard completes metadata and localized controls", async (t)
         Publicar
       </button>
     </div>
-    <div role="dialog" id="unrelated-dialog">
+    <div role="region" id="unrelated-dialog">
       <button
         role="radio"
         aria-label="P\u00fablico"
@@ -584,7 +591,9 @@ test("YouTube PT-BR wizard completes metadata and localized controls", async (t)
 
   const activeSurface = await getActiveUploadSurface(page);
   assert.equal(await activeSurface.getAttribute("id"), "publish-dialog");
-  const publishAttempt = await setVisibilityAndPublish(page);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  const publishAttempt = await setVisibilityAndPublish(page, operation);
   assert.equal(publishAttempt.ok, true);
   assert.deepEqual(
     await page.evaluate(() => window.youtubePublishClicks),
@@ -600,7 +609,8 @@ test("YouTube PT-BR wizard completes metadata and localized controls", async (t)
   );
   const confirmation = await waitForPublishConfirmation(
     page,
-    publishAttempt.baselineTexts
+    publishAttempt.baselineTexts,
+    { operation }
   );
   assert.equal(confirmation.ok, true);
   assert.equal(confirmation.confirmed, true);
@@ -608,6 +618,263 @@ test("YouTube PT-BR wizard completes metadata and localized controls", async (t)
   assert.equal(confirmation.matchedText, "V\u00eddeo publicado");
   assert.equal(confirmation.videoUrl, null);
   assert.equal(confirmation.videoId, null);
+});
+
+test("YouTube rejects multiple active upload wizards before binding", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <div role="dialog" id="first-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+    </div>
+    <div role="dialog" id="second-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+    </div>
+  `);
+
+  await assert.rejects(
+    createYouTubeOperationBinding(page),
+    /2 active upload surfaces were recognized/
+  );
+});
+
+test("YouTube ignores fresh global confirmation not bound to the upload operation", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <div role="dialog" id="bound-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+    </div>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  await page.locator("body").evaluate((body) => {
+    const alert = document.createElement("div");
+    alert.setAttribute("role", "alert");
+    alert.textContent = "V\u00eddeo publicado";
+    body.appendChild(alert);
+  });
+
+  const result = await waitForPublishConfirmation(page, [], {
+    operation,
+    maxPolls: 2,
+    pollIntervalMs: 5,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, "uncertain");
+  assert.equal(result.retryAllowed, false);
+});
+
+test("YouTube accepts fresh confirmation inside the bound upload wizard", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <div role="dialog" id="bound-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+    </div>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  await page.locator("#bound-upload-wizard").evaluate((surface) => {
+    const confirmation = document.createElement("div");
+    confirmation.textContent = "V\u00eddeo publicado";
+    surface.appendChild(confirmation);
+  });
+
+  const result = await waitForPublishConfirmation(page, [], {
+    operation,
+    maxPolls: 2,
+    pollIntervalMs: 5,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.confirmed, true);
+  assert.equal(result.evidenceType, "upload-surface");
+});
+
+test("YouTube rejects upload wizard replacement before Publish with zero final clicks", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <script>window.youtubeReplacementPublishClicks = 0;</script>
+    <div role="dialog" id="upload-wizard">
+      <button name="PUBLIC" role="radio" aria-label="P\u00fablico" aria-checked="false">
+        P\u00fablico
+      </button>
+      <button onclick="window.youtubeReplacementPublishClicks += 1">Publicar</button>
+    </div>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  await page.locator("#upload-wizard").evaluate((surface) => {
+    const replacement = surface.cloneNode(true);
+    surface.replaceWith(replacement);
+  });
+
+  await assert.rejects(
+    setVisibilityAndPublish(page, operation),
+    /identity changed during the upload operation/
+  );
+  assert.equal(
+    await page.evaluate(() => window.youtubeReplacementPublishClicks),
+    0
+  );
+});
+
+test("YouTube rejects inner wizard replacement under a persistent upload host", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <script>window.youtubeNestedReplacementPublishClicks = 0;</script>
+    <ytcp-uploads-dialog id="upload-host">
+      <tp-yt-paper-dialog id="dialog" role="dialog">
+        <button name="PUBLIC" role="radio" aria-label="P\u00fablico" aria-checked="false">
+          P\u00fablico
+        </button>
+        <button onclick="window.youtubeNestedReplacementPublishClicks += 1">
+          Publicar
+        </button>
+      </tp-yt-paper-dialog>
+    </ytcp-uploads-dialog>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  await page.locator("#upload-host > #dialog").evaluate((wizard) => {
+    wizard.replaceWith(wizard.cloneNode(true));
+  });
+
+  await assert.rejects(
+    setVisibilityAndPublish(page, operation),
+    /identity changed during the upload operation/
+  );
+  assert.equal(
+    await page.evaluate(() => window.youtubeNestedReplacementPublishClicks),
+    0
+  );
+});
+
+test("YouTube rejects sibling inner wizards under one upload host", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <ytcp-uploads-dialog id="upload-host">
+      <tp-yt-paper-dialog id="dialog" role="dialog">
+        <textarea aria-label="T\u00edtulo"></textarea>
+        <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+      </tp-yt-paper-dialog>
+      <div role="dialog" id="second-inner-wizard">
+        <textarea aria-label="T\u00edtulo"></textarea>
+        <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+      </div>
+    </ytcp-uploads-dialog>
+  `);
+
+  await assert.rejects(
+    createYouTubeOperationBinding(page),
+    /2 active inner upload wizards were recognized/
+  );
+});
+
+test("YouTube preserves explicit post-click failure as non-retryable", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <div role="dialog" id="bound-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+      <div>N\u00e3o foi poss\u00edvel publicar</div>
+    </div>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  const confirmation = await waitForPublishConfirmation(page, [], {
+    operation,
+    maxPolls: 1,
+    pollIntervalMs: 0,
+  });
+  assert.equal(confirmation.ok, false);
+  assert.equal(confirmation.outcome, "failure");
+  assert.equal(confirmation.retryAllowed, false);
+  assert.equal(confirmation.clickAttempted, true);
+  assert.deepEqual(confirmation.evidence, {
+    evidenceType: "operation-bound-error",
+    operationBound: true,
+    expectedVideoId: null,
+  });
+
+  const error = Object.assign(new Error(confirmation.reason), confirmation);
+  const normalized = buildYouTubeUploadFailureResult(error, "evidence.png");
+  assert.equal(normalized.outcome, "failure");
+  assert.equal(normalized.retryAllowed, false);
+  assert.equal(normalized.clickAttempted, true);
+});
+
+test("YouTube treats conflicting bound post-click evidence as uncertain", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+
+  await page.setContent(`
+    <div role="dialog" id="bound-upload-wizard">
+      <textarea aria-label="T\u00edtulo"></textarea>
+      <textarea aria-label="Descri\u00e7\u00e3o"></textarea>
+      <div>V\u00eddeo publicado</div>
+      <div>N\u00e3o foi poss\u00edvel publicar</div>
+    </div>
+  `);
+  const operation = await createYouTubeOperationBinding(page);
+  t.after(() => disposeYouTubeOperation(operation));
+  const confirmation = await waitForPublishConfirmation(page, [], {
+    operation,
+    maxPolls: 1,
+    pollIntervalMs: 0,
+  });
+  assert.equal(confirmation.ok, false);
+  assert.equal(confirmation.outcome, "uncertain");
+  assert.equal(confirmation.retryAllowed, false);
+  assert.equal(confirmation.clickAttempted, true);
+  assert.deepEqual(confirmation.evidence, {
+    evidenceType: "confirmation-conflict",
+    operationBound: true,
+    expectedVideoId: null,
+  });
+});
+
+test("YouTube failure result preserves an uncertain no-retry outcome", () => {
+  const error = new Error("ambiguous final click");
+  error.outcome = "uncertain";
+  error.retryAllowed = false;
+  error.clickAttempted = true;
+  error.reason = "publish result is operation-bound but inconclusive";
+  error.evidence = { evidenceType: "upload-surface" };
+
+  assert.deepEqual(buildYouTubeUploadFailureResult(error, "evidence.png"), {
+    ok: false,
+    outcome: "uncertain",
+    retryAllowed: false,
+    clickAttempted: true,
+    reason: "publish result is operation-bound but inconclusive",
+    evidence: { evidenceType: "upload-surface" },
+    error: "ambiguous final click",
+    screenshotPath: "evidence.png",
+  });
 });
 
 test("YouTube confirms an immediate visible post-publish dialog", async (t) => {
@@ -747,6 +1014,20 @@ test("YouTube keeps no-evidence confirmation fail-safe without retry", async (t)
   assert.equal(result.confirmed, false);
   assert.equal(result.outcome, "uncertain");
   assert.equal(result.retryAllowed, false);
+  assert.equal(result.clickAttempted, true);
+  assert.deepEqual(result.evidence, {
+    evidenceType: "confirmation-timeout",
+    operationBound: false,
+    expectedVideoId: null,
+  });
+  const normalized = buildYouTubeUploadFailureResult(
+    Object.assign(new Error(result.reason), result),
+    "evidence.png"
+  );
+  assert.equal(normalized.outcome, "uncertain");
+  assert.equal(normalized.retryAllowed, false);
+  assert.equal(normalized.clickAttempted, true);
+  assert.deepEqual(normalized.evidence, result.evidence);
   assert.match(result.reason, /publication may have succeeded/i);
   assert.equal(await page.evaluate(() => window.youtubeNoEvidenceClicks), 0);
 });
@@ -772,6 +1053,8 @@ test("YouTube timeout after the final click never clicks Publish again", async (
   });
   assert.equal(result.ok, false);
   assert.equal(result.retryAllowed, false);
+  assert.equal(result.clickAttempted, true);
+  assert.equal(result.evidence.evidenceType, "confirmation-timeout");
   assert.equal(await page.evaluate(() => window.youtubeTimeoutPublishClicks), 1);
 });
 
